@@ -46,6 +46,12 @@ export function startWatcher(opts: WatcherOptions): () => Promise<void> {
     ignoreInitial: false,
     awaitWriteFinish: false,
     persistent: true,
+    // Polling is mandatory on Windows for files being APPENDED to (like JSONL
+    // logs). Native fs.watch misses append-only writes consistently. Cost: a
+    // little CPU. 500ms interval gives near-instant feel without burning.
+    usePolling: true,
+    interval: 500,
+    binaryInterval: 1000,
   });
 
   const handleChange = async (filePath: string) => {

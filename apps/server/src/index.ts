@@ -77,11 +77,26 @@ fastify.get("/api/forest", async () => {
     slug,
     sessionCount: sids.length,
   }));
+  // "Active session": prefer the one registered by the SessionStart hook.
+  // Fall back to the most-recently-touched session (works without the hook).
+  const hookActive = state.getActiveSession();
+  let activeSessionId = hookActive.sessionId;
+  if (!activeSessionId) {
+    let bestTs = "";
+    for (const s of state.forest.sessions.values()) {
+      if (s.lastActivityAt && s.lastActivityAt > bestTs) {
+        bestTs = s.lastActivityAt;
+        activeSessionId = s.sessionId;
+      }
+    }
+  }
   return {
     nodes,
     forks: state.forest.forks,
     projects,
     sessionCount: state.forest.sessions.size,
+    activeSessionId,
+    activeSessionAt: hookActive.at,
   };
 });
 
@@ -152,11 +167,14 @@ fastify.get<{
   if (!map) return reply.code(404).send({ error: "session not found" });
   const node = map.get(uuid);
   if (!node) return reply.code(404).send({ error: "node not found in session" });
-  // Re-read the raw record from the file so we can return the full message content,
-  // since GraphNode.preview is only the first 140 chars.
-  const meta = state.forest.sessions.get(sessionId);
-  const filePath = meta?.filePath || join(CONFIG.projectsRoot, meta?.projectSlug ?? "", `${sessionId}.jsonl`);
-  const raw = await findRawByUuid(filePath, uuid);
+  // Look up the raw record by scanning every file that belongs to this session
+  // (main JSONL + any subagent JSONLs). Stop at first match.
+  const files = state.getSessionFiles(sessionId);
+  let raw: unknown = null;
+  for (const f of files) {
+    raw = await findRawByUuid(f, uuid);
+    if (raw) break;
+  }
   return { node, raw };
 });
 

@@ -8,8 +8,15 @@ export type SseEvent =
 /**
  * Opens an SSE connection to /api/stream. The native EventSource API can't set
  * custom headers, so we pass the token via query string.
+ *
+ * `onConnect` fires on initial open AND on every auto-reconnect — use it to
+ * re-fetch full state and backfill any events missed during the disconnect window
+ * (EventSource doesn't replay missed events on reconnect).
  */
-export function useSse(onEvent: (e: SseEvent) => void): void {
+export function useSse(
+  onEvent: (e: SseEvent) => void,
+  onConnect?: () => void,
+): void {
   useEffect(() => {
     const token = getToken();
     if (!token) return;
@@ -27,9 +34,16 @@ export function useSse(onEvent: (e: SseEvent) => void): void {
 
     es.addEventListener("delta", handler);
     es.addEventListener("active-session", handler);
+    es.onopen = () => {
+      // eslint-disable-next-line no-console
+      console.log("[cc-map] sse connected");
+      onConnect?.();
+    };
     es.onerror = () => {
-      // EventSource will auto-reconnect. We don't surface the error.
+      // EventSource will auto-reconnect. onopen fires again on success.
+      // eslint-disable-next-line no-console
+      console.log("[cc-map] sse error — reconnecting");
     };
     return () => es.close();
-  }, [onEvent]);
+  }, [onEvent, onConnect]);
 }

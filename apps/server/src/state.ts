@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   type Delta,
+  discoverFiles,
   type Forest,
   type GraphNode,
   type SessionMeta,
@@ -44,23 +45,38 @@ export class ServerState {
   private subscribers = new Set<DeltaSubscriber>();
   /** Cache of full per-session node content keyed by sessionId. */
   private fullContentCache = new Map<string, Map<string, GraphNode>>();
+  /**
+   * Map of sessionId -> list of JSONL files that contain nodes for that session.
+   * A "session" can have a main file at the project root AND subagent files at
+   * `<sessionId>/subagents/`. Some sessions exist ONLY as subagent files (main
+   * was archived or never created), so we have to look across all files.
+   */
+  private sessionFiles = new Map<string, string[]>();
 
-  private constructor(forest: Forest, persisted: PersistedState) {
+  private constructor(forest: Forest, persisted: PersistedState, sessionFiles: Map<string, string[]>) {
     this.forest = forest;
     this.persisted = persisted;
+    this.sessionFiles = sessionFiles;
   }
 
   static async load(): Promise<ServerState> {
     const t0 = Date.now();
-    const [forest, persisted] = await Promise.all([
+    const [forest, persisted, files] = await Promise.all([
       loadForest(CONFIG.projectsRoot),
       loadPersisted(),
+      discoverFiles(CONFIG.projectsRoot),
     ]);
+    const sessionFiles = new Map<string, string[]>();
+    for (const f of files) {
+      const arr = sessionFiles.get(f.sessionId) ?? [];
+      arr.push(f.filePath);
+      sessionFiles.set(f.sessionId, arr);
+    }
     const elapsed = Date.now() - t0;
     console.log(
-      `[state] forest loaded in ${elapsed}ms: ${forest.nodes.size} nodes, ${forest.sessions.size} sessions, ${forest.forks.length} forks`,
+      `[state] forest loaded in ${elapsed}ms: ${forest.nodes.size} nodes, ${forest.sessions.size} sessions, ${forest.forks.length} forks, ${files.length} files`,
     );
-    return new ServerState(forest, persisted);
+    return new ServerState(forest, persisted, sessionFiles);
   }
 
   /** Start watching the JSONL tree for changes. Returns a stop function. */
@@ -151,31 +167,36 @@ export class ServerState {
   }
 
   /**
-   * Lazy-load all nodes (full content) for a session by re-parsing its file.
-   * Cached per-session. Used by the message-pane endpoint.
+   * Lazy-load all nodes (full content) for a session by re-parsing all of its
+   * source JSONL files (main + subagents). Cached per-session.
    */
   async getFullSessionNodes(sessionId: string): Promise<Map<string, GraphNode> | null> {
     const cached = this.fullContentCache.get(sessionId);
     if (cached) return cached;
-    const meta = this.forest.sessions.get(sessionId);
-    if (!meta) return null;
-    // Find the file path. Prefer meta.filePath; otherwise derive.
-    let filePath = meta.filePath;
-    if (!filePath) {
-      filePath = join(CONFIG.projectsRoot, meta.projectSlug, `${sessionId}.jsonl`);
+    const projectSlug = this.forest.projectsBySession.get(sessionId);
+    const files = this.sessionFiles.get(sessionId) ?? [];
+    // Fallback: convention-based path if discovery missed it (shouldn't happen)
+    if (files.length === 0 && projectSlug) {
+      files.push(join(CONFIG.projectsRoot, projectSlug, `${sessionId}.jsonl`));
     }
-    try {
-      const nodes = await parseFile(filePath, {
-        projectSlug: meta.projectSlug,
-        sessionId,
-      });
-      const map = new Map<string, GraphNode>();
-      for (const n of nodes) map.set(n.id, n);
-      this.fullContentCache.set(sessionId, map);
-      return map;
-    } catch {
-      return null;
+    if (files.length === 0 || !projectSlug) return null;
+    const map = new Map<string, GraphNode>();
+    for (const filePath of files) {
+      try {
+        const nodes = await parseFile(filePath, { projectSlug, sessionId });
+        for (const n of nodes) map.set(n.id, n);
+      } catch {
+        // skip unreadable
+      }
     }
+    if (map.size === 0) return null;
+    this.fullContentCache.set(sessionId, map);
+    return map;
+  }
+
+  /** Get the list of source files for a session (for raw-record lookups). */
+  getSessionFiles(sessionId: string): string[] {
+    return this.sessionFiles.get(sessionId) ?? [];
   }
 }
 
