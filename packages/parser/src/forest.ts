@@ -1,0 +1,261 @@
+import { readdir, stat } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { parseFile } from "./jsonl.js";
+import type { Forest, ForkInfo, GraphNode, SessionMeta } from "./types.js";
+
+export interface DiscoveredFile {
+  filePath: string;
+  projectSlug: string;
+  sessionId: string;
+  isSidechain: boolean;
+}
+
+/**
+ * Walk ~/.claude/projects/ and return every JSONL file we care about.
+ *
+ * Structure observed:
+ *   projects/<slug>/<sessionId>.jsonl                ← main session transcript
+ *   projects/<slug>/<sessionId>/subagents/agent-*.jsonl  ← subagent transcripts
+ *
+ * `projectSlug` = directory name directly under `projects/`.
+ * `sessionId` for main file = file basename (without .jsonl).
+ * `sessionId` for subagent = the parent <sessionId> directory name.
+ */
+export async function discoverFiles(projectsRoot: string): Promise<DiscoveredFile[]> {
+  const out: DiscoveredFile[] = [];
+  const projectDirs = await safeReaddir(projectsRoot);
+  for (const projectSlug of projectDirs) {
+    const projectPath = join(projectsRoot, projectSlug);
+    if (!(await isDir(projectPath))) continue;
+    const entries = await safeReaddir(projectPath);
+    for (const entry of entries) {
+      const fullPath = join(projectPath, entry);
+      if (entry.endsWith(".jsonl")) {
+        const sessionId = entry.slice(0, -".jsonl".length);
+        out.push({ filePath: fullPath, projectSlug, sessionId, isSidechain: false });
+      } else if (await isDir(fullPath)) {
+        // Possible <sessionId>/subagents/
+        const subPath = join(fullPath, "subagents");
+        if (await isDir(subPath)) {
+          const subFiles = await safeReaddir(subPath);
+          for (const subFile of subFiles) {
+            if (!subFile.endsWith(".jsonl")) continue;
+            out.push({
+              filePath: join(subPath, subFile),
+              projectSlug,
+              sessionId: entry, // parent <sessionId> dir
+              isSidechain: true,
+            });
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+async function safeReaddir(p: string): Promise<string[]> {
+  try {
+    return await readdir(p);
+  } catch {
+    return [];
+  }
+}
+
+async function isDir(p: string): Promise<boolean> {
+  try {
+    const s = await stat(p);
+    return s.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build a Forest from a stream of GraphNodes. Computes:
+ *   - childrenOf adjacency, deduped + sorted by timestamp
+ *   - sessionsContainingNode (which sessions each uuid appears in — `--fork-session`
+ *     copies messages with the same uuid into new session files, so this is plural)
+ *   - roots (nodes with no parent or whose parent isn't in `nodes`)
+ *   - per-session metadata (counts include shared messages from forked sessions)
+ *   - forks: uuids whose children belong to 2+ sessions = the fork POINT
+ *
+ * IMPORTANT: build adjacency from the raw stream BEFORE dedup. Otherwise, when
+ * the same uuid appears in 3 forked-session files, dedup would discard 2 copies
+ * and we'd lose 2/3 of the (parent → child) edges.
+ *
+ * Pure function — caller is responsible for getting the nodes.
+ */
+export function buildForest(nodes: Iterable<GraphNode>): Forest {
+  const nodeMap = new Map<string, GraphNode>();
+  const sessionsContainingNodeSet = new Map<string, Set<string>>();
+  const childrenOfSet = new Map<string, Set<string>>();
+  // For fork detection: parent uuid -> set of sessionIds its child-edges live in
+  const parentToChildSessions = new Map<string, Set<string>>();
+
+  // Per-session metadata accumulators. Count each appearance, including
+  // shared-via-fork copies — that matches the user's mental model of "how
+  // many messages did session X have."
+  const sessionsAcc = new Map<string, SessionMeta>();
+
+  for (const node of nodes) {
+    // Dedup nodes (last-write-wins, but they should be content-equal for shared uuids)
+    nodeMap.set(node.id, node);
+
+    // Track every session this uuid appears in
+    let setS = sessionsContainingNodeSet.get(node.id);
+    if (!setS) {
+      setS = new Set();
+      sessionsContainingNodeSet.set(node.id, setS);
+    }
+    setS.add(node.sessionId);
+
+    // Build edges from the raw stream — once per file appearance
+    if (node.parentId != null) {
+      let kids = childrenOfSet.get(node.parentId);
+      if (!kids) {
+        kids = new Set();
+        childrenOfSet.set(node.parentId, kids);
+      }
+      kids.add(node.id);
+
+      let sess = parentToChildSessions.get(node.parentId);
+      if (!sess) {
+        sess = new Set();
+        parentToChildSessions.set(node.parentId, sess);
+      }
+      sess.add(node.sessionId);
+    }
+
+    // Per-session metadata. Each file-appearance counts.
+    const isPrompt = node.classification.role === "user" && node.classification.subtype === "prompt";
+    const existing = sessionsAcc.get(node.sessionId);
+    if (!existing) {
+      sessionsAcc.set(node.sessionId, {
+        sessionId: node.sessionId,
+        projectSlug: node.projectSlug,
+        filePath: "",
+        startedAt: node.timestamp,
+        lastActivityAt: node.timestamp,
+        cwd: node.cwd,
+        nodeCount: 1,
+        promptCount: isPrompt ? 1 : 0,
+      });
+    } else {
+      existing.nodeCount += 1;
+      if (isPrompt) existing.promptCount += 1;
+      if (!existing.startedAt || node.timestamp < existing.startedAt) {
+        existing.startedAt = node.timestamp;
+      }
+      if (!existing.lastActivityAt || node.timestamp > existing.lastActivityAt) {
+        existing.lastActivityAt = node.timestamp;
+      }
+      if (!existing.cwd && node.cwd) existing.cwd = node.cwd;
+    }
+  }
+
+  // Convert children sets to timestamp-sorted arrays
+  const childrenOf = new Map<string, string[]>();
+  for (const [parentId, set] of childrenOfSet) {
+    const arr = [...set].sort((a, b) => {
+      const na = nodeMap.get(a)?.timestamp ?? "";
+      const nb = nodeMap.get(b)?.timestamp ?? "";
+      return na < nb ? -1 : na > nb ? 1 : 0;
+    });
+    childrenOf.set(parentId, arr);
+  }
+
+  // Roots: deduped nodes whose parent isn't in nodeMap
+  const roots: string[] = [];
+  for (const node of nodeMap.values()) {
+    if (node.parentId == null || !nodeMap.has(node.parentId)) {
+      roots.push(node.id);
+    }
+  }
+  roots.sort((a, b) => {
+    const na = nodeMap.get(a)?.timestamp ?? "";
+    const nb = nodeMap.get(b)?.timestamp ?? "";
+    return na < nb ? -1 : na > nb ? 1 : 0;
+  });
+
+  // Forks: parent uuids whose children's edges originated from 2+ sessions
+  const forks: ForkInfo[] = [];
+  for (const [parentUuid, sessionSet] of parentToChildSessions) {
+    if (sessionSet.size >= 2) {
+      forks.push({ parentUuid, sessionIds: [...sessionSet].sort() });
+    }
+  }
+
+  // Project index
+  const projectsBySession = new Map<string, string>();
+  const sessionsByProject = new Map<string, string[]>();
+  for (const meta of sessionsAcc.values()) {
+    projectsBySession.set(meta.sessionId, meta.projectSlug);
+    const arr = sessionsByProject.get(meta.projectSlug);
+    if (arr) arr.push(meta.sessionId);
+    else sessionsByProject.set(meta.projectSlug, [meta.sessionId]);
+  }
+  for (const arr of sessionsByProject.values()) {
+    arr.sort((a, b) => {
+      const sa = sessionsAcc.get(a)?.startedAt ?? "";
+      const sb = sessionsAcc.get(b)?.startedAt ?? "";
+      return sa < sb ? -1 : sa > sb ? 1 : 0;
+    });
+  }
+
+  // Materialize sessionsContainingNode as arrays
+  const sessionsContainingNode = new Map<string, string[]>();
+  for (const [uuid, set] of sessionsContainingNodeSet) {
+    sessionsContainingNode.set(uuid, [...set].sort());
+  }
+
+  return {
+    nodes: nodeMap,
+    sessionsContainingNode,
+    childrenOf,
+    roots,
+    sessions: sessionsAcc,
+    projectsBySession,
+    sessionsByProject,
+    forks,
+  };
+}
+
+/**
+ * High-level: discover + parse + build forest. Convenience for one-shot use.
+ */
+export async function loadForest(projectsRoot: string): Promise<Forest> {
+  const files = await discoverFiles(projectsRoot);
+  const allNodes: GraphNode[] = [];
+  await Promise.all(
+    files.map(async (f) => {
+      try {
+        const nodes = await parseFile(f.filePath, {
+          projectSlug: f.projectSlug,
+          sessionId: f.sessionId,
+        });
+        allNodes.push(...nodes);
+      } catch {
+        // skip unreadable files
+      }
+    }),
+  );
+  const forest = buildForest(allNodes);
+  // backfill filePath on session metas
+  for (const f of files) {
+    if (f.isSidechain) continue;
+    const meta = forest.sessions.get(f.sessionId);
+    if (meta && !meta.filePath) meta.filePath = f.filePath;
+  }
+  return forest;
+}
+
+/** Resolve the project's session filePath for a sessionId. Falls back to deriving from convention. */
+export function sessionFilePath(projectsRoot: string, projectSlug: string, sessionId: string): string {
+  return join(projectsRoot, projectSlug, `${sessionId}.jsonl`);
+}
+
+/** For tests: ensure pure-function buildForest doesn't accidentally use globals. */
+export function _internals() {
+  return { basename, dirname };
+}

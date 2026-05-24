@@ -1,0 +1,27 @@
+{
+  "name": "cc-map",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Visualize Claude Code CLI sessions: chip-column session viewer + 2D tree-map across all sessions.",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev": "npm run dev --workspace=apps/server",
+    "dev:web": "npm run dev --workspace=packages/web"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.22.3",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.5"
+  }
+}

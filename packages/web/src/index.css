@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+  }
+}
+
+/* Compact scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(63 63 70);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(82 82 91);
+}
+
+/* Markdown styling */
+.md-body p { margin: 0.5em 0; }
+.md-body pre { background: rgb(24 24 27); padding: 0.75em; border-radius: 0.375em; overflow-x: auto; margin: 0.75em 0; font-size: 0.875em; }
+.md-body code { background: rgb(39 39 42); padding: 0.125em 0.25em; border-radius: 0.25em; font-size: 0.875em; }
+.md-body pre code { background: transparent; padding: 0; }
+.md-body ul { padding-left: 1.5em; list-style: disc; }
+.md-body ol { padding-left: 1.5em; list-style: decimal; }
+.md-body h1, .md-body h2, .md-body h3 { font-weight: 600; margin: 0.75em 0 0.5em; }
+.md-body h1 { font-size: 1.25em; }
+.md-body h2 { font-size: 1.125em; }
+.md-body h3 { font-size: 1em; }
+.md-body a { color: rgb(96 165 250); text-decoration: underline; }
+.md-body table { border-collapse: collapse; margin: 0.5em 0; }
+.md-body th, .md-body td { border: 1px solid rgb(63 63 70); padding: 0.25em 0.5em; }
