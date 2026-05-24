@@ -3,17 +3,28 @@ import { basename, dirname, join } from "node:path";
 import { extractSidecarHint, parseFile } from "./jsonl.js";
 import type { Forest, ForkInfo, GraphNode, SessionMeta } from "./types.js";
 
-/** Walk a file once to extract sidecar info (ai-title etc) that isn't a graph node. */
-async function extractSidecars(filePath: string): Promise<Map<string, { aiTitle?: string }>> {
-  const out = new Map<string, { aiTitle?: string }>();
+interface SidecarAggregate {
+  aiTitle?: string;
+  toolsUsed: Set<string>;
+}
+
+/** Walk a file once to extract sidecar info (ai-title, tools used) that isn't a graph node. */
+async function extractSidecars(filePath: string): Promise<Map<string, SidecarAggregate>> {
+  const out = new Map<string, SidecarAggregate>();
   try {
     const text = await readFile(filePath, "utf8");
     for (const line of text.split(/\r?\n/)) {
       const hint = extractSidecarHint(line);
       if (!hint) continue;
-      const cur = out.get(hint.sessionId) ?? {};
+      let cur = out.get(hint.sessionId);
+      if (!cur) {
+        cur = { toolsUsed: new Set() };
+        out.set(hint.sessionId, cur);
+      }
       if (hint.aiTitle) cur.aiTitle = hint.aiTitle;
-      out.set(hint.sessionId, cur);
+      if (hint.toolNames) {
+        for (const n of hint.toolNames) cur.toolsUsed.add(n);
+      }
     }
   } catch {
     // skip
@@ -165,6 +176,7 @@ export function buildForest(nodes: Iterable<GraphNode>): Forest {
           cacheReadTokens: node.usage?.cacheReadTokens ?? 0,
           cacheCreationTokens: node.usage?.cacheCreationTokens ?? 0,
         },
+        toolsUsed: [],
       });
     } else {
       existing.nodeCount += 1;
@@ -278,16 +290,26 @@ export async function loadForest(projectsRoot: string): Promise<Forest> {
     const meta = forest.sessions.get(f.sessionId);
     if (meta && !meta.filePath) meta.filePath = f.filePath;
   }
-  // Backfill aiTitle by scanning every file once for sidecar records
+  // Backfill aiTitle + toolsUsed by scanning every file once for sidecar records
+  const toolsBySession = new Map<string, Set<string>>();
   await Promise.all(
     files.map(async (f) => {
       const hints = await extractSidecars(f.filePath);
       for (const [sid, h] of hints) {
         const meta = forest.sessions.get(sid);
         if (meta && h.aiTitle && !meta.aiTitle) meta.aiTitle = h.aiTitle;
+        if (h.toolsUsed.size > 0) {
+          let acc = toolsBySession.get(sid);
+          if (!acc) { acc = new Set(); toolsBySession.set(sid, acc); }
+          for (const t of h.toolsUsed) acc.add(t);
+        }
       }
     }),
   );
+  for (const [sid, tools] of toolsBySession) {
+    const meta = forest.sessions.get(sid);
+    if (meta) meta.toolsUsed = [...tools].sort();
+  }
   return forest;
 }
 

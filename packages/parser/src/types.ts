@@ -13,9 +13,18 @@ export type UserSubtype =
   | "system-reminder" // <system-reminder>... injected by the harness
   | "other";          // anything that didn't match (defensive)
 
+/**
+ * Sub-classifications of `type: "assistant"` records.
+ * - "text"      — at least one non-empty text block (the human-readable reply)
+ * - "tool-only" — only tool_use blocks; no text (pure JSON intermediate turn)
+ * - "thinking"  — only thinking blocks (extended-thinking traces; opaque base64)
+ * - "other"     — empty / malformed
+ */
+export type AssistantSubtype = "text" | "tool-only" | "thinking" | "other";
+
 export type NodeClassification =
   | { role: "user"; subtype: UserSubtype }
-  | { role: "assistant" };
+  | { role: "assistant"; subtype: AssistantSubtype };
 
 export interface RawRecord {
   // Required for any record we keep
@@ -90,6 +99,8 @@ export interface SessionMeta {
   aiTitle: string | null;
   /** Sum of token usage across all assistant turns in this session. */
   totalUsage: NodeUsage;
+  /** Names of tools the assistant invoked at least once in this session. */
+  toolsUsed: string[];
 }
 
 export interface ForkInfo {

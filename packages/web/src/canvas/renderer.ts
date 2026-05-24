@@ -311,8 +311,98 @@ function renderDetail(
     }
   }
   drawSessionLabels(ctx, layout, state, view, /*minBandPx=*/ 12);
+  // Inline node text labels (only when zoomed in enough — and capped to avoid clutter)
+  if (scale >= 1.5) {
+    drawInlineNodeLabels(ctx, layout, state, view);
+  }
   drawSelectionAndHover(ctx, layout, state);
   drawLiveTip(ctx, layout, state);
+}
+
+/**
+ * Draw a short preview string to the RIGHT of each visible node.
+ *
+ * No auto-reflow / staircase: positions are deterministic in layout coords,
+ * so labels don't jump around as you zoom. In cramped rows (multiple nodes
+ * close together on the same Y), labels that don't fit are simply skipped —
+ * hover for the full text on those.
+ */
+function drawInlineNodeLabels(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  state: RenderState,
+  view: { x0: number; y0: number; x1: number; y1: number },
+): void {
+  const scale = state.transform.scale;
+  const fontPx = 11 / scale;
+  ctx.font = `${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+  ctx.textBaseline = "middle";
+  const baseR = Math.max(LAYOUT.nodeRadius, 2.5 / scale);
+  const padX = 6 / scale;
+  const padY = 2 / scale;
+  const MAX_LABELS = 400;
+  // Below this much horizontal room (in screen pixels), don't even try.
+  const MIN_LABEL_PX = 60;
+
+  // Pre-bucket by Y so we can find each node's horizontal next-neighbor cheaply.
+  const yBucket = (y: number) => Math.round(y / 4) * 4;
+  const byY = new Map<number, typeof layout.nodes extends Map<infer _K, infer V> ? V[] : never>();
+  for (const n of layout.nodes.values()) {
+    if (n.x < view.x0 || n.x > view.x1 || n.y < view.y0 || n.y > view.y1) continue;
+    if (!n.preview) continue;
+    const k = yBucket(n.y);
+    let arr = byY.get(k);
+    if (!arr) {
+      arr = [];
+      byY.set(k, arr);
+    }
+    arr.push(n);
+  }
+
+  let count = 0;
+  for (const nodes of byY.values()) {
+    if (count >= MAX_LABELS) return;
+    nodes.sort((a, b) => a.x - b.x);
+    for (let i = 0; i < nodes.length; i++) {
+      if (count >= MAX_LABELS) return;
+      const n = nodes[i];
+      if (!n) continue;
+      const r = baseR * nodeSizeMul(n.role, n.subtype);
+      const nextN = nodes[i + 1];
+      // Room available (in layout units) before the next node on this row
+      const availLayout = nextN
+        ? Math.max(0, nextN.x - n.x - r - (baseR * nodeSizeMul(nextN.role, nextN.subtype)) - padX * 2)
+        : Infinity;
+      if (availLayout * scale < MIN_LABEL_PX) continue; // too cramped → skip
+
+      const text = n.preview;
+      const metrics = ctx.measureText(text);
+      // Cap at available room — but no truncation since we skip when too tight
+      const visibleWidth = Math.min(metrics.width, availLayout);
+      const labelX = n.x + r + padX;
+      const labelY = n.y;
+
+      ctx.fillStyle = "rgba(9, 9, 11, 0.85)";
+      ctx.fillRect(labelX - padX / 2, labelY - fontPx / 2 - padY, visibleWidth + padX, fontPx + padY * 2);
+      // Color by role
+      ctx.fillStyle =
+        n.role === "user" && n.subtype === "prompt" ? "#a7f3d0" :
+        n.role === "assistant" ? "#fde68a" :
+        "#a1a1aa";
+      // Clip text to visibleWidth if needed (no ellipsis — clean cut)
+      if (metrics.width > availLayout) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(labelX - padX, labelY - fontPx, visibleWidth + padX * 2, fontPx * 2);
+        ctx.clip();
+        ctx.fillText(text, labelX, labelY);
+        ctx.restore();
+      } else {
+        ctx.fillText(text, labelX, labelY);
+      }
+      count += 1;
+    }
+  }
 }
 
 /**

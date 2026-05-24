@@ -136,6 +136,7 @@ function aggregateSessions(nodes: GraphNode[]): SessionMeta[] {
           cacheReadTokens: n.usage?.cacheReadTokens ?? 0,
           cacheCreationTokens: n.usage?.cacheCreationTokens ?? 0,
         },
+        toolsUsed: [],
       });
     } else {
       if (n.usage) {

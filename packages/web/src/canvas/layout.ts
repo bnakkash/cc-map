@@ -37,11 +37,15 @@ export function buildLayout(
   scopeProject: string | null,
   visibility: VisibilityFilter = DEFAULT_VISIBILITY,
   direction: LayoutDirection = "grid",
+  allowedSessions: Set<string> | null = null,
 ): Layout {
-  // Filter nodes by scope
-  const scopeNodes = scopeProject
+  // Filter nodes by scope (+ optional session allow-list from the facet filter)
+  let scopeNodes = scopeProject
     ? payload.nodes.filter((n) => n.projectSlug === scopeProject)
     : payload.nodes;
+  if (allowedSessions) {
+    scopeNodes = scopeNodes.filter((n) => allowedSessions.has(n.sessionId));
+  }
 
   // Full node map (visible + hidden) used to walk ancestor chains when hiding.
   const fullNodeMap = new Map<string, ForestNode>();

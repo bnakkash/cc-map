@@ -3,6 +3,24 @@ import { open } from "node:fs/promises";
 import { classify, extractPreview } from "./classifier.js";
 import type { GraphNode, NodeUsage, RawRecord } from "./types.js";
 
+/** Pull names of tools invoked in an assistant record (Bash, Edit, Read, etc.). */
+export function extractToolNames(record: RawRecord): string[] {
+  if (record.type !== "assistant") return [];
+  const content = (record.message as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) return [];
+  const names: string[] = [];
+  for (const b of content) {
+    if (b && typeof b === "object") {
+      const t = (b as { type?: unknown }).type;
+      if (t === "tool_use") {
+        const n = (b as { name?: unknown }).name;
+        if (typeof n === "string") names.push(n);
+      }
+    }
+  }
+  return names;
+}
+
 /** Pull token usage from an assistant record. Returns null for non-assistant or missing data. */
 function extractUsage(record: RawRecord): NodeUsage | null {
   if (record.type !== "assistant") return null;
@@ -24,10 +42,12 @@ function extractUsage(record: RawRecord): NodeUsage | null {
   };
 }
 
-/** Record-extracted session metadata (ai-title etc). null when none in this line. */
+/** Record-extracted session metadata (ai-title, tools used etc). null when none in this line. */
 export interface SessionSidecarHint {
   sessionId: string;
   aiTitle?: string;
+  /** Tool names invoked in this record (if any) — caller aggregates per session. */
+  toolNames?: string[];
 }
 
 export function extractSidecarHint(line: string): SessionSidecarHint | null {
@@ -43,6 +63,12 @@ export function extractSidecarHint(line: string): SessionSidecarHint | null {
     const out: SessionSidecarHint = { sessionId: r.sessionId };
     if (typeof title === "string") out.aiTitle = title;
     return out;
+  }
+  if (r.type === "assistant" && typeof r.sessionId === "string") {
+    const tools = extractToolNames(r);
+    if (tools.length > 0) {
+      return { sessionId: r.sessionId, toolNames: tools };
+    }
   }
   return null;
 }

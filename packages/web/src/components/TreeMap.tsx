@@ -16,7 +16,7 @@ import {
   render,
 } from "../canvas/renderer.js";
 import { projectColor } from "../canvas/colors.js";
-import { DEFAULT_VISIBILITY, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
+import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type SessionFilter, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
 
 const PAN_THRESHOLD_PX = 5;
 
@@ -80,6 +80,21 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     directionChangedRef.current = true;
   }, [direction]);
+  const [filter, setFilter] = useState<SessionFilter>(() => {
+    try {
+      const raw = localStorage.getItem("cc-map-filter");
+      if (raw) return { ...DEFAULT_FILTER, ...JSON.parse(raw) };
+    } catch {}
+    return DEFAULT_FILTER;
+  });
+  const updateFilter = useCallback((patch: Partial<SessionFilter>) => {
+    setFilter((prev) => {
+      const next = { ...prev, ...patch };
+      try { localStorage.setItem("cc-map-filter", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
+
   const [visibility, setVisibility] = useState<VisibilityFilter>(() => {
     try {
       const raw = localStorage.getItem("cc-map-visibility");
@@ -182,14 +197,55 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   }, []);
   useSse(onSse, fetchForest);
 
+  // ───── Allowed sessions from facet filter ─────
+  // null means "no filter active" — buildLayout treats this as everything allowed.
+  const allowedSessions = useMemo(() => {
+    if (!forest) return null;
+    const hasActiveFilter =
+      filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly;
+    if (!hasActiveFilter) return null;
+    const bookmarkedSessions = new Set<string>();
+    if (filter.bookmarkedOnly) {
+      for (const n of forest.nodes) if (bookmarks.has(n.id)) bookmarkedSessions.add(n.sessionId);
+    }
+    const startMs = filter.startDate ? new Date(filter.startDate + "T00:00:00").getTime() : -Infinity;
+    const endMs = filter.endDate ? new Date(filter.endDate + "T23:59:59").getTime() : Infinity;
+    const allowed = new Set<string>();
+    for (const [sid, info] of Object.entries(forest.sessionTitles ?? {})) {
+      // Date filter — overlap test
+      const startedMs = info.startedAt ? new Date(info.startedAt).getTime() : 0;
+      const endedMs = info.lastActivityAt ? new Date(info.lastActivityAt).getTime() : startedMs;
+      if (endedMs < startMs || startedMs > endMs) continue;
+      // Tool filter — at least one required tool must be present
+      if (filter.requiredTools.length > 0) {
+        const has = filter.requiredTools.some((t) => info.toolsUsed.includes(t));
+        if (!has) continue;
+      }
+      // Bookmark filter
+      if (filter.bookmarkedOnly && !bookmarkedSessions.has(sid)) continue;
+      allowed.add(sid);
+    }
+    return allowed;
+  }, [forest, filter, bookmarks]);
+
   // ───── Layout ─────
   const layout: Layout | null = useMemo(() => {
     if (!forest) return null;
     const t0 = performance.now();
-    const l = buildLayout(forest, mode, mode === "per-project" ? scopeProject : null, visibility, direction);
+    const l = buildLayout(forest, mode, mode === "per-project" ? scopeProject : null, visibility, direction, allowedSessions);
     console.log(`layout: ${l.nodes.size} nodes, ${l.sessionBands.length} sessions in ${(performance.now() - t0).toFixed(0)}ms`);
     return l;
-  }, [forest, mode, scopeProject, visibility, direction]);
+  }, [forest, mode, scopeProject, visibility, direction, allowedSessions]);
+
+  // Union of tools across all sessions in the current scope — what we offer in the filter UI
+  const availableTools = useMemo(() => {
+    if (!forest?.sessionTitles) return [] as string[];
+    const tools = new Set<string>();
+    for (const [, info] of Object.entries(forest.sessionTitles)) {
+      for (const t of info.toolsUsed) tools.add(t);
+    }
+    return [...tools].sort();
+  }, [forest]);
 
   // ───── Search matches ─────
   const matches = useMemo(() => {
@@ -824,10 +880,82 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             ))}
           </div>
         </div>
+        {/* Faceted filter */}
+        <div className="pt-2 border-t border-zinc-800 space-y-1">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-zinc-500 text-xs">Filter sessions</span>
+            {(filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly) && (
+              <button
+                onClick={() => updateFilter({ startDate: null, endDate: null, requiredTools: [], bookmarkedOnly: false })}
+                className="text-zinc-500 hover:text-zinc-200 text-[10px] underline"
+                title="clear all filters"
+              >
+                clear
+              </button>
+            )}
+          </div>
+          <div className="flex items-center gap-1 text-[10px] text-zinc-400">
+            <label className="text-zinc-500 w-8 shrink-0">from</label>
+            <input
+              type="date"
+              value={filter.startDate ?? ""}
+              onChange={(e) => updateFilter({ startDate: e.target.value || null })}
+              className="bg-zinc-900 border border-zinc-800 rounded px-1 py-0.5 text-zinc-200 text-[10px] flex-1 min-w-0"
+            />
+          </div>
+          <div className="flex items-center gap-1 text-[10px] text-zinc-400">
+            <label className="text-zinc-500 w-8 shrink-0">to</label>
+            <input
+              type="date"
+              value={filter.endDate ?? ""}
+              onChange={(e) => updateFilter({ endDate: e.target.value || null })}
+              className="bg-zinc-900 border border-zinc-800 rounded px-1 py-0.5 text-zinc-200 text-[10px] flex-1 min-w-0"
+            />
+          </div>
+          <label className="flex items-center gap-2 px-1 py-1 rounded cursor-pointer hover:bg-zinc-900 text-xs text-zinc-400">
+            <input
+              type="checkbox"
+              checked={filter.bookmarkedOnly}
+              onChange={(e) => updateFilter({ bookmarkedOnly: e.target.checked })}
+              className="w-3 h-3 accent-zinc-400"
+            />
+            <span>★ bookmarked only</span>
+          </label>
+          {availableTools.length > 0 && (
+            <div>
+              <div className="text-zinc-500 text-[10px] mt-1 mb-1">tools used (any)</div>
+              <div className="flex flex-wrap gap-1 max-h-32 overflow-y-auto">
+                {availableTools.map((t) => {
+                  const on = filter.requiredTools.includes(t);
+                  return (
+                    <button
+                      key={t}
+                      onClick={() => updateFilter({
+                        requiredTools: on
+                          ? filter.requiredTools.filter((x) => x !== t)
+                          : [...filter.requiredTools, t],
+                      })}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${on ? "bg-emerald-700 text-emerald-100" : "bg-zinc-900 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"}`}
+                    >
+                      {t}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          {allowedSessions && (
+            <div className="text-[10px] text-zinc-500 pt-1">
+              matched: {allowedSessions.size} / {forest.sessionCount} sessions
+            </div>
+          )}
+        </div>
         <div className="pt-2 border-t border-zinc-800">
           <div className="text-zinc-500 text-xs mb-1">Show</div>
           <VisToggle label="Prompts"        color="#34d399" on={visibility.prompt}        onChange={() => toggleVisibility("prompt")} />
-          <VisToggle label="Replies"        color="#fbbf24" on={visibility.assistant}     onChange={() => toggleVisibility("assistant")} />
+          <VisToggle label="Replies (text)" color="#fbbf24" on={visibility.assistantText} onChange={() => toggleVisibility("assistantText")} />
+          <VisToggle label="Replies (tool calls)" color="#92400e" on={visibility.assistantToolOnly} onChange={() => toggleVisibility("assistantToolOnly")} />
+          <VisToggle label="Replies (thinking)" color="#6366f1" on={visibility.assistantThinking} onChange={() => toggleVisibility("assistantThinking")} />
           <VisToggle label="Subagents"      color="#c084fc" on={visibility.subagent}      onChange={() => toggleVisibility("subagent")} />
           <VisToggle label="Tool results"   color="#52525b" on={visibility.toolResult}    onChange={() => toggleVisibility("toolResult")} />
           <VisToggle label="Slash commands" color="#71717a" on={visibility.slashCommand}  onChange={() => toggleVisibility("slashCommand")} />

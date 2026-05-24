@@ -23,7 +23,27 @@ export interface SessionTokens {
 export interface SessionTitleInfo {
   aiTitle: string | null;
   tokens: SessionTokens;
+  toolsUsed: string[];
+  startedAt: string | null;
+  lastActivityAt: string | null;
 }
+
+export interface SessionFilter {
+  /** ISO date strings (YYYY-MM-DD). Sessions with no overlap are filtered out. */
+  startDate: string | null;
+  endDate: string | null;
+  /** When non-empty, session must have used AT LEAST one of these tools. */
+  requiredTools: string[];
+  /** When true, only show bookmarked sessions (any node bookmarked counts). */
+  bookmarkedOnly: boolean;
+}
+
+export const DEFAULT_FILTER: SessionFilter = {
+  startDate: null,
+  endDate: null,
+  requiredTools: [],
+  bookmarkedOnly: false,
+};
 
 export interface ForkInfo {
   parentUuid: string;
@@ -113,7 +133,12 @@ export interface SequenceLink {
 }
 
 export interface VisibilityFilter {
-  assistant: boolean;
+  /** Assistant turns with at least one text block (the human-readable reply). */
+  assistantText: boolean;
+  /** Assistant turns that are ONLY tool_use blocks — the JSON noise. */
+  assistantToolOnly: boolean;
+  /** Assistant turns that are ONLY thinking blocks — extended-thinking traces. */
+  assistantThinking: boolean;
   prompt: boolean;
   toolResult: boolean;
   slashCommand: boolean;
@@ -122,7 +147,9 @@ export interface VisibilityFilter {
 }
 
 export const DEFAULT_VISIBILITY: VisibilityFilter = {
-  assistant: true,
+  assistantText: true,
+  assistantToolOnly: false,
+  assistantThinking: false,
   prompt: true,
   toolResult: false,
   slashCommand: false,
@@ -132,7 +159,13 @@ export const DEFAULT_VISIBILITY: VisibilityFilter = {
 
 export function isNodeVisible(n: ForestNode, vf: VisibilityFilter): boolean {
   if (n.isSidechain && !vf.subagent) return false;
-  if (n.role === "assistant") return vf.assistant;
+  if (n.role === "assistant") {
+    // ForestNode.subtype for assistant is "text" / "tool-only" / "thinking" / "other"
+    if (n.subtype === "tool-only") return vf.assistantToolOnly;
+    if (n.subtype === "thinking") return vf.assistantThinking;
+    if (n.subtype === "other") return false; // empty/malformed — never useful
+    return vf.assistantText; // "text"
+  }
   switch (n.subtype) {
     case "prompt": return vf.prompt;
     case "tool-result": return vf.toolResult;

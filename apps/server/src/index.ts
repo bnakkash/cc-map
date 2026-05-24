@@ -68,7 +68,7 @@ fastify.get("/api/forest", async () => {
       sessionId: n.sessionId,
       projectSlug: n.projectSlug,
       role: n.classification.role,
-      subtype: n.classification.role === "user" ? n.classification.subtype : null,
+      subtype: n.classification.subtype,
       isSidechain: n.isSidechain,
       timestamp: n.timestamp,
       preview: n.preview.slice(0, 80),
@@ -90,7 +90,16 @@ fastify.get("/api/forest", async () => {
       tokens: { input: totalInput, output: totalOutput, cacheRead: totalCacheRead, cacheCreation: totalCacheCreate },
     };
   });
-  const sessionTitles: Record<string, { aiTitle: string | null; tokens: { input: number; output: number; cacheRead: number; cacheCreation: number } }> = {};
+  const sessionTitles: Record<
+    string,
+    {
+      aiTitle: string | null;
+      tokens: { input: number; output: number; cacheRead: number; cacheCreation: number };
+      toolsUsed: string[];
+      startedAt: string | null;
+      lastActivityAt: string | null;
+    }
+  > = {};
   for (const m of state.forest.sessions.values()) {
     sessionTitles[m.sessionId] = {
       aiTitle: m.aiTitle,
@@ -100,6 +109,9 @@ fastify.get("/api/forest", async () => {
         cacheRead: m.totalUsage.cacheReadTokens,
         cacheCreation: m.totalUsage.cacheCreationTokens,
       },
+      toolsUsed: m.toolsUsed,
+      startedAt: m.startedAt,
+      lastActivityAt: m.lastActivityAt,
     };
   }
   // "Active session": prefer the one registered by the SessionStart hook.

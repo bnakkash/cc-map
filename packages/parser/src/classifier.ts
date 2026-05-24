@@ -1,4 +1,4 @@
-import type { NodeClassification, UserSubtype } from "./types.js";
+import type { AssistantSubtype, NodeClassification, UserSubtype } from "./types.js";
 
 const COMMAND_NAME_RE = /^<command-name>/;
 const COMMAND_STDOUT_RE = /^<local-command-stdout>/;
@@ -20,7 +20,7 @@ export function classify(record: {
   message?: { role?: string; content?: unknown };
 }): NodeClassification | null {
   if (record.type === "assistant") {
-    return { role: "assistant" };
+    return { role: "assistant", subtype: classifyAssistantContent(record.message?.content) };
   }
   if (record.type !== "user") {
     return null;
@@ -28,6 +28,35 @@ export function classify(record: {
   const content = record.message?.content;
   const subtype = classifyUserContent(content);
   return { role: "user", subtype };
+}
+
+/** Detect whether an assistant turn has any non-empty text block. */
+function classifyAssistantContent(content: unknown): AssistantSubtype {
+  if (typeof content === "string") {
+    return content.trim().length > 0 ? "text" : "other";
+  }
+  if (Array.isArray(content)) {
+    let hasText = false;
+    let hasTool = false;
+    let hasThinking = false;
+    for (const b of content) {
+      if (!b || typeof b !== "object") continue;
+      const t = (b as { type?: unknown }).type;
+      if (t === "text") {
+        const txt = (b as { text?: unknown }).text;
+        if (typeof txt === "string" && txt.trim().length > 0) hasText = true;
+      } else if (t === "tool_use") {
+        hasTool = true;
+      } else if (t === "thinking") {
+        hasThinking = true;
+      }
+    }
+    if (hasText) return "text";
+    if (hasTool) return "tool-only";
+    if (hasThinking) return "thinking";
+    return "other";
+  }
+  return "other";
 }
 
 function classifyUserContent(content: unknown): UserSubtype {
