@@ -122,6 +122,26 @@ export interface Layout {
 
 export type ViewMode = "per-project" | "all-projects";
 export type LayoutDirection = "grid" | "column";
+export type NodeStyle = "dots" | "cards";
+
+/**
+ * A user-created top-level workspace. Has a name + a curated list of session
+ * IDs to include. Switching INTO a space shows the forest filtered to those
+ * sessions only. Later (Phase 3c) spawning a new Claude Code session inside a
+ * space automatically adds the new sessionId to its member list.
+ */
+export interface Space {
+  id: string;
+  name: string;
+  /** HSL hue 0-360 for visual identification in the sidebar list. */
+  hue: number;
+  /** Session IDs that belong to this space. Filters the forest when active. */
+  sessionIds: string[];
+  /** Optional free-form note shown at the top of the space's canvas. */
+  note: string;
+  /** ISO timestamp of creation. */
+  createdAt: string;
+}
 
 export interface SequenceLink {
   /** uuid of the last node in the previous root's chain (within the session) */
@@ -197,4 +217,17 @@ export const LAYOUT = {
   columnSideH: 18,
   /** Column mode: vertical gap between sessions stacked top-to-bottom. */
   columnSessionGap: 180,
+  // ───── Card mode (text-box rendering) ─────
+  /** Card width in layout units. */
+  cardWidth: 220,
+  /** Card line height. Card total height = lineHeight × visible lines + padding. */
+  cardLineHeight: 14,
+  /** Padding inside each card. */
+  cardPadding: 8,
+  /** Vertical spacing between cards in card mode (replaces nodeSpacingV). */
+  cardSpacingV: 12,
+  /** Horizontal spacing between sibling cards in card mode (replaces nodeSpacingH). */
+  cardSpacingH: 240,
+  /** Max preview lines shown per card. */
+  cardMaxLines: 4,
 } as const;

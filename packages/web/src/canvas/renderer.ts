@@ -6,7 +6,7 @@ import {
   nodeColor,
   projectColor,
 } from "./colors.js";
-import { LAYOUT, type Layout, type SessionBand, type ViewMode } from "./types.js";
+import { LAYOUT, type Layout, type NodeStyle, type SessionBand, type ViewMode } from "./types.js";
 
 // Draw dashed sequence links between same-session disconnected roots.
 function drawSequenceLinks(
@@ -63,6 +63,8 @@ export interface RenderState {
   liveTipId: string | null;
   /** Monotonic ms timestamp used to animate the pulse. */
   nowMs: number;
+  /** Render each node as a text card instead of a dot. */
+  nodeStyle: NodeStyle;
 }
 
 /**
@@ -256,6 +258,11 @@ function renderDetail(
   view: { x0: number; y0: number; x1: number; y1: number },
 ): void {
   const scale = state.transform.scale;
+  // Card mode dispatches to a completely different render
+  if (state.nodeStyle === "cards") {
+    renderCards(ctx, layout, state, view);
+    return;
+  }
   // Faint session backgrounds for visual grouping; active session gets a brighter tint
   for (const band of layout.sessionBands) {
     if (!intersects(band, view)) continue;
@@ -432,6 +439,192 @@ function nodeAlpha(role: "user" | "assistant", subtype: string | null): number {
     if (subtype === "system-reminder") return 0.4;
   }
   return 1.0;
+}
+
+/**
+ * Card-mode rendering: each node is a text box showing its preview content.
+ * Cards anchored at the layout x/y (top-left), wider than tall typically.
+ * Edges drawn between card centers.
+ */
+function renderCards(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  state: RenderState,
+  view: { x0: number; y0: number; x1: number; y1: number },
+): void {
+  const scale = state.transform.scale;
+  const cardW = LAYOUT.cardWidth;
+  const cardH = LAYOUT.cardLineHeight * LAYOUT.cardMaxLines + LAYOUT.cardPadding * 2 + 14; // 14 for header
+
+  // Faint session backgrounds first
+  for (const band of layout.sessionBands) {
+    if (!intersects(band, view)) continue;
+    const w = band.maxX - band.minX + cardW;
+    const h = band.maxY - band.minY + cardH;
+    const isHover = band.sessionId === state.hoveredSessionId;
+    const isActive = band.sessionId === state.activeSessionId;
+    ctx.globalAlpha = isActive ? 0.18 : isHover ? 0.14 : 0.05;
+    ctx.fillStyle = projectColor(band.projectSlug);
+    roundRect(ctx, band.minX, band.minY, w, h, 8);
+    ctx.fill();
+    if (isActive) {
+      const pulse = 0.5 + 0.5 * Math.sin(state.nowMs / 350);
+      ctx.strokeStyle = `rgba(52, 211, 153, ${0.4 + 0.4 * pulse})`;
+      ctx.lineWidth = Math.max(1.5, 2 / scale);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Edges (parent center → child center)
+  ctx.lineWidth = Math.max(1, 1 / scale);
+  for (const e of layout.edges) {
+    const from = layout.nodes.get(e.fromId);
+    const to = layout.nodes.get(e.toId);
+    if (!from || !to) continue;
+    const fx = from.x + cardW / 2;
+    const fy = from.y + cardH;
+    const tx = to.x + cardW / 2;
+    const ty = to.y;
+    if (Math.max(fx, tx) < view.x0 || Math.min(fx, tx) > view.x1) continue;
+    if (Math.max(fy, ty) < view.y0 || Math.min(fy, ty) > view.y1) continue;
+    ctx.strokeStyle = e.isFork ? EDGE_FORK_COLOR : EDGE_COLOR;
+    ctx.beginPath();
+    ctx.moveTo(fx, fy);
+    if (e.isFork) {
+      const midY = (fy + ty) / 2;
+      ctx.bezierCurveTo(fx, midY, tx, midY, tx, ty);
+    } else {
+      ctx.lineTo(tx, ty);
+    }
+    ctx.stroke();
+  }
+
+  // Cards
+  const fontPx = 11;
+  const headerPx = 9;
+  ctx.textBaseline = "top";
+  for (const n of layout.nodes.values()) {
+    if (n.x + cardW < view.x0 || n.x > view.x1) continue;
+    if (n.y + cardH < view.y0 || n.y > view.y1) continue;
+    drawCard(ctx, n, state, cardW, cardH, fontPx, headerPx);
+  }
+
+  // Selection ring (already part of card border for selected, but draw the LIVE pulse here)
+  drawLiveTip(ctx, layout, state);
+}
+
+function drawCard(
+  ctx: CanvasRenderingContext2D,
+  n: import("./types.js").LayoutNode,
+  state: RenderState,
+  cardW: number,
+  cardH: number,
+  fontPx: number,
+  headerPx: number,
+): void {
+  const x = n.x;
+  const y = n.y;
+  const isSelected = n.id === state.selectedId;
+  const isHovered = n.id === state.hoveredId;
+  const isHi = state.highlightedNodeIds?.has(n.id);
+  const color = nodeColor(n.role, n.subtype, n.isSidechain);
+
+  // Card background
+  ctx.fillStyle = isSelected ? "rgba(39, 39, 42, 0.98)" : "rgba(24, 24, 27, 0.92)";
+  roundRect(ctx, x, y, cardW, cardH, 6);
+  ctx.fill();
+
+  // Border
+  ctx.strokeStyle = isSelected ? NODE_RING_SELECTED : isHovered ? "#ffffff" : isHi ? "#ffffff" : color;
+  ctx.lineWidth = isSelected || isHovered || isHi ? 2 : 1;
+  ctx.stroke();
+  // Fork ring
+  if (n.isFork) {
+    ctx.strokeStyle = NODE_RING_FORK;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.roundRect?.(x - 2, y - 2, cardW + 4, cardH + 4, 8);
+    ctx.stroke();
+  }
+
+  // Header: role/subtype + (right-aligned) hint
+  ctx.fillStyle = color;
+  ctx.font = `bold ${headerPx}px ui-sans-serif, system-ui, sans-serif`;
+  const header =
+    n.role === "user" && n.subtype === "prompt" ? "prompt" :
+    n.role === "assistant" && n.subtype === "text" ? "assistant" :
+    n.role === "assistant" && n.subtype === "tool-only" ? "tool call" :
+    n.role === "assistant" && n.subtype === "thinking" ? "thinking" :
+    n.role === "user" ? (n.subtype ?? "user") :
+    "assistant";
+  ctx.fillText(header.toUpperCase(), x + LAYOUT.cardPadding, y + LAYOUT.cardPadding);
+
+  // Subagent badge top-right
+  if (n.isSidechain) {
+    const label = "SUBAGENT";
+    ctx.fillStyle = "#c084fc";
+    ctx.textAlign = "right";
+    ctx.fillText(label, x + cardW - LAYOUT.cardPadding, y + LAYOUT.cardPadding);
+    ctx.textAlign = "left";
+  }
+
+  // Body text — wrap to N lines
+  ctx.fillStyle = "#e4e4e7";
+  ctx.font = `${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+  const text = n.preview || "(empty)";
+  drawWrappedText(
+    ctx,
+    text,
+    x + LAYOUT.cardPadding,
+    y + LAYOUT.cardPadding + headerPx + 6,
+    cardW - LAYOUT.cardPadding * 2,
+    LAYOUT.cardLineHeight,
+    LAYOUT.cardMaxLines,
+  );
+}
+
+/** Greedy word-wrap into N lines, with ellipsis if text overflows. */
+function drawWrappedText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+  lineHeight: number,
+  maxLines: number,
+): void {
+  const words = text.split(/\s+/);
+  let line = "";
+  let lineIdx = 0;
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]!;
+    const test = line.length === 0 ? word : line + " " + word;
+    if (ctx.measureText(test).width > maxWidth) {
+      // commit current line
+      if (lineIdx === maxLines - 1) {
+        // Last line; truncate with ellipsis if there's more
+        let truncated = line;
+        const remaining = words.slice(i).join(" ");
+        if (remaining.length > 0) {
+          while (ctx.measureText(truncated + " …").width > maxWidth && truncated.length > 1) {
+            truncated = truncated.slice(0, -1);
+          }
+          truncated = truncated + " …";
+        }
+        ctx.fillText(truncated, x, y + lineIdx * lineHeight);
+        return;
+      }
+      ctx.fillText(line, x, y + lineIdx * lineHeight);
+      lineIdx += 1;
+      line = word;
+    } else {
+      line = test;
+    }
+  }
+  if (line.length > 0 && lineIdx < maxLines) {
+    ctx.fillText(line, x, y + lineIdx * lineHeight);
+  }
 }
 
 // ───── Drawing helpers ─────
@@ -616,23 +809,34 @@ export function hitTest(
   transform: Transform,
   screenX: number,
   screenY: number,
+  nodeStyle: NodeStyle = "dots",
 ): { kind: "node"; id: string } | { kind: "session"; id: string } | null {
   const lx = (screenX - transform.tx) / transform.scale;
   const ly = (screenY - transform.ty) / transform.scale;
   const lod = lodOf(transform.scale);
   if (lod === "detail") {
-    const baseR = Math.max(LAYOUT.nodeRadius, 2.5 / transform.scale);
-    const slack = 4 / transform.scale;
-    let best: { id: string; d2: number } | null = null;
-    for (const n of layout.nodes.values()) {
-      const r = baseR * nodeSizeMul(n.role, n.subtype) + slack;
-      const r2 = r * r;
-      const dx = n.x - lx;
-      const dy = n.y - ly;
-      const d2 = dx * dx + dy * dy;
-      if (d2 <= r2 && (!best || d2 < best.d2)) best = { id: n.id, d2 };
+    if (nodeStyle === "cards") {
+      const cardW = LAYOUT.cardWidth;
+      const cardH = LAYOUT.cardLineHeight * LAYOUT.cardMaxLines + LAYOUT.cardPadding * 2 + 14;
+      for (const n of layout.nodes.values()) {
+        if (lx >= n.x && lx <= n.x + cardW && ly >= n.y && ly <= n.y + cardH) {
+          return { kind: "node", id: n.id };
+        }
+      }
+    } else {
+      const baseR = Math.max(LAYOUT.nodeRadius, 2.5 / transform.scale);
+      const slack = 4 / transform.scale;
+      let best: { id: string; d2: number } | null = null;
+      for (const n of layout.nodes.values()) {
+        const r = baseR * nodeSizeMul(n.role, n.subtype) + slack;
+        const r2 = r * r;
+        const dx = n.x - lx;
+        const dy = n.y - ly;
+        const d2 = dx * dx + dy * dy;
+        if (d2 <= r2 && (!best || d2 < best.d2)) best = { id: n.id, d2 };
+      }
+      if (best) return { kind: "node", id: best.id };
     }
-    if (best) return { kind: "node", id: best.id };
   }
   // At session/overview LOD, hit-test session bands
   for (const band of layout.sessionBands) {

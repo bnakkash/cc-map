@@ -8,6 +8,7 @@ import {
   type LayoutDirection,
   type LayoutEdge,
   type LayoutNode,
+  type NodeStyle,
   type SequenceLink,
   type SessionBand,
   type ViewMode,
@@ -38,7 +39,13 @@ export function buildLayout(
   visibility: VisibilityFilter = DEFAULT_VISIBILITY,
   direction: LayoutDirection = "grid",
   allowedSessions: Set<string> | null = null,
+  nodeStyle: NodeStyle = "dots",
 ): Layout {
+  // Card mode uses larger spacing so cards can fit side-by-side and stack without
+  // overlapping. Otherwise spacing is the dot defaults.
+  const cardTotalH = LAYOUT.cardLineHeight * LAYOUT.cardMaxLines + LAYOUT.cardPadding * 2;
+  const SPACING_V = nodeStyle === "cards" ? cardTotalH + LAYOUT.cardSpacingV : LAYOUT.nodeSpacingV;
+  const SPACING_H = nodeStyle === "cards" ? LAYOUT.cardSpacingH : LAYOUT.nodeSpacingH;
   // Filter nodes by scope (+ optional session allow-list from the facet filter)
   let scopeNodes = scopeProject
     ? payload.nodes.filter((n) => n.projectSlug === scopeProject)
@@ -137,21 +144,21 @@ export function buildLayout(
   //
   // Width(node) = max(child widths + per-sibling offset)
   // Height(node) = nodeSpacingV (own row) + sum(child heights)
-  const SIBLING_X_OFFSET: number = LAYOUT.nodeSpacingH;
+  const SIBLING_X_OFFSET: number = SPACING_H;
   const subtreeWidth = new Map<string, number>();
   const subtreeHeight = new Map<string, number>();
   const widthVisited = new Set<string>();
   const heightVisited = new Set<string>();
   const computeWidth = (id: string): number => {
     if (subtreeWidth.has(id)) return subtreeWidth.get(id)!;
-    if (widthVisited.has(id)) return LAYOUT.nodeSpacingH;
+    if (widthVisited.has(id)) return SPACING_H;
     widthVisited.add(id);
     const kids = sortedChildren.get(id);
     if (!kids || kids.length === 0) {
-      subtreeWidth.set(id, LAYOUT.nodeSpacingH);
-      return LAYOUT.nodeSpacingH;
+      subtreeWidth.set(id, SPACING_H);
+      return SPACING_H;
     }
-    let maxKidWidth: number = LAYOUT.nodeSpacingH;
+    let maxKidWidth: number = SPACING_H;
     for (let i = 0; i < kids.length; i++) {
       const kw = computeWidth(kids[i]!);
       const candidate = kw + i * SIBLING_X_OFFSET;
@@ -162,18 +169,18 @@ export function buildLayout(
   };
   const computeHeight = (id: string): number => {
     if (subtreeHeight.has(id)) return subtreeHeight.get(id)!;
-    if (heightVisited.has(id)) return LAYOUT.nodeSpacingV;
+    if (heightVisited.has(id)) return SPACING_V;
     heightVisited.add(id);
     const kids = sortedChildren.get(id);
     if (!kids || kids.length === 0) {
-      subtreeHeight.set(id, LAYOUT.nodeSpacingV);
-      return LAYOUT.nodeSpacingV;
+      subtreeHeight.set(id, SPACING_V);
+      return SPACING_V;
     }
     let totalKidHeight = 0;
     for (const k of kids) {
       totalKidHeight += computeHeight(k);
     }
-    subtreeHeight.set(id, LAYOUT.nodeSpacingV + totalKidHeight);
+    subtreeHeight.set(id, SPACING_V + totalKidHeight);
     return subtreeHeight.get(id)!;
   };
   for (const r of roots) {
@@ -409,6 +416,8 @@ export function buildLayout(
       edges,
       forkParents,
       payloadIndex: payload,
+      spacingV: SPACING_V,
+      spacingH: SPACING_H,
     });
 
     // Project band: track the y-range that this project occupies + max width
@@ -589,6 +598,8 @@ function placeTree(
     edges: LayoutEdge[];
     forkParents: Set<string>;
     payloadIndex: ForestPayload;
+    spacingV: number;
+    spacingH: number;
   },
 ): void {
   const node = ctx.nodeMap.get(id);
@@ -613,13 +624,13 @@ function placeTree(
   if (!kids || kids.length === 0) return;
 
   // Vertical stacking: first child directly below parent (continues the spine);
-  // subsequent siblings step right by SIBLING_X_OFFSET so their branches are
+  // subsequent siblings step right by ctx.spacingH so their branches are
   // distinguishable from the spine and edges have somewhere to curve to.
-  let cy = yTop + LAYOUT.nodeSpacingV;
+  let cy = yTop + ctx.spacingV;
   for (let i = 0; i < kids.length; i++) {
     const kid = kids[i]!;
     const kh = ctx.subtreeHeight.get(kid)!;
-    const cx = xLeft + i * LAYOUT.nodeSpacingH;
+    const cx = xLeft + i * ctx.spacingH;
     placeTree(kid, cx, cy, ctx);
     ctx.edges.push({
       fromId: id,

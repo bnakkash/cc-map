@@ -18,7 +18,7 @@ import {
   render,
 } from "../canvas/renderer.js";
 import { projectColor } from "../canvas/colors.js";
-import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type SessionFilter, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
+import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type NodeStyle, type SessionFilter, type Space, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
 
 const PAN_THRESHOLD_PX = 5;
 
@@ -49,6 +49,68 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     try { localStorage.setItem("cc-map-input-mode", inputMode); } catch {}
   }, [inputMode]);
+  // ───── Spaces (top-level workspaces) ─────
+  // A Space is a curated subset of the forest. Switching INTO a space filters
+  // the map to its member sessions. Spaces are persisted to localStorage.
+  // Phase 3c will let you spawn new CC sessions directly into a space.
+  const [spaces, setSpaces] = useState<Space[]>(() => {
+    try {
+      const raw = localStorage.getItem("cc-map-spaces-v2");
+      if (raw) return JSON.parse(raw) as Space[];
+    } catch {}
+    return [];
+  });
+  const [activeSpaceId, setActiveSpaceId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem("cc-map-active-space") || null;
+    } catch { return null; }
+  });
+  useEffect(() => {
+    try {
+      if (activeSpaceId) localStorage.setItem("cc-map-active-space", activeSpaceId);
+      else localStorage.removeItem("cc-map-active-space");
+    } catch {}
+  }, [activeSpaceId]);
+  const persistSpaces = useCallback((arr: Space[]) => {
+    setSpaces(arr);
+    try { localStorage.setItem("cc-map-spaces-v2", JSON.stringify(arr)); } catch {}
+  }, []);
+  const upsertSpace = useCallback((sp: Space) => {
+    setSpaces((prev) => {
+      const next = prev.some((p) => p.id === sp.id)
+        ? prev.map((p) => (p.id === sp.id ? sp : p))
+        : [...prev, sp];
+      try { localStorage.setItem("cc-map-spaces-v2", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
+  const deleteSpace = useCallback((id: string) => {
+    setSpaces((prev) => {
+      const next = prev.filter((p) => p.id !== id);
+      try { localStorage.setItem("cc-map-spaces-v2", JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setActiveSpaceId((cur) => (cur === id ? null : cur));
+  }, []);
+  const activeSpace = activeSpaceId ? spaces.find((s) => s.id === activeSpaceId) ?? null : null;
+  // Add/remove a session from the active space
+  const addSessionToSpace = useCallback((sid: string, targetSpaceId?: string) => {
+    const id = targetSpaceId ?? activeSpaceId;
+    if (!id) return;
+    const sp = spaces.find((s) => s.id === id);
+    if (!sp) return;
+    if (sp.sessionIds.includes(sid)) return;
+    upsertSpace({ ...sp, sessionIds: [...sp.sessionIds, sid] });
+  }, [spaces, activeSpaceId, upsertSpace]);
+  const removeSessionFromSpace = useCallback((sid: string, targetSpaceId?: string) => {
+    const id = targetSpaceId ?? activeSpaceId;
+    if (!id) return;
+    const sp = spaces.find((s) => s.id === id);
+    if (!sp) return;
+    upsertSpace({ ...sp, sessionIds: sp.sessionIds.filter((x) => x !== sid) });
+  }, [spaces, activeSpaceId, upsertSpace]);
+  void persistSpaces; // exposed for future bulk ops
+
   // ───── Bookmarks (per-uuid) ─────
   const [bookmarks, setBookmarks] = useState<Set<string>>(() => {
     try {
@@ -67,6 +129,17 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     });
   }, []);
 
+  const [nodeStyle, setNodeStyle] = useState<NodeStyle>(() => {
+    try {
+      const raw = localStorage.getItem("cc-map-nodestyle");
+      if (raw === "cards" || raw === "dots") return raw;
+    } catch {}
+    return "dots";
+  });
+  useEffect(() => {
+    try { localStorage.setItem("cc-map-nodestyle", nodeStyle); } catch {}
+  }, [nodeStyle]);
+
   const [direction, setDirection] = useState<LayoutDirection>(() => {
     try {
       const raw = localStorage.getItem("cc-map-direction");
@@ -77,11 +150,11 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     try { localStorage.setItem("cc-map-direction", direction); } catch {}
   }, [direction]);
-  // Mark that direction changed so the next layout build triggers an auto-refit.
+  // Mark that direction or node style changed so the next layout build triggers an auto-refit.
   const directionChangedRef = useRef(false);
   useEffect(() => {
     directionChangedRef.current = true;
-  }, [direction]);
+  }, [direction, nodeStyle]);
   const [filter, setFilter] = useState<SessionFilter>(() => {
     try {
       const raw = localStorage.getItem("cc-map-filter");
@@ -199,13 +272,14 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   }, []);
   useSse(onSse, fetchForest);
 
-  // ───── Allowed sessions from facet filter ─────
+  // ───── Allowed sessions from facet filter + active space ─────
   // null means "no filter active" — buildLayout treats this as everything allowed.
   const allowedSessions = useMemo(() => {
     if (!forest) return null;
     const hasActiveFilter =
       filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly;
-    if (!hasActiveFilter) return null;
+    const hasActiveSpace = activeSpace !== null;
+    if (!hasActiveFilter && !hasActiveSpace) return null;
     const bookmarkedSessions = new Set<string>();
     if (filter.bookmarkedOnly) {
       for (const n of forest.nodes) if (bookmarks.has(n.id)) bookmarkedSessions.add(n.sessionId);
@@ -225,19 +299,21 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       }
       // Bookmark filter
       if (filter.bookmarkedOnly && !bookmarkedSessions.has(sid)) continue;
+      // Active space filter — must be a member
+      if (activeSpace && !activeSpace.sessionIds.includes(sid)) continue;
       allowed.add(sid);
     }
     return allowed;
-  }, [forest, filter, bookmarks]);
+  }, [forest, filter, bookmarks, activeSpace]);
 
   // ───── Layout ─────
   const layout: Layout | null = useMemo(() => {
     if (!forest) return null;
     const t0 = performance.now();
-    const l = buildLayout(forest, mode, mode === "per-project" ? scopeProject : null, visibility, direction, allowedSessions);
+    const l = buildLayout(forest, mode, mode === "per-project" ? scopeProject : null, visibility, direction, allowedSessions, nodeStyle);
     console.log(`layout: ${l.nodes.size} nodes, ${l.sessionBands.length} sessions in ${(performance.now() - t0).toFixed(0)}ms`);
     return l;
-  }, [forest, mode, scopeProject, visibility, direction, allowedSessions]);
+  }, [forest, mode, scopeProject, visibility, direction, allowedSessions, nodeStyle]);
 
   // Union of tools across all sessions in the current scope — what we offer in the filter UI
   const availableTools = useMemo(() => {
@@ -335,7 +411,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   const fittedKey = useRef<string>("");
   useEffect(() => {
     if (!layout || !forest) return;
-    const key = `${mode}::${scopeProject}::${size.w}x${size.h}::${direction}`;
+    const key = `${mode}::${scopeProject}::${size.w}x${size.h}::${direction}::${nodeStyle}`;
     if (fittedKey.current === key) return;
     if (size.w < 50 || size.h < 50) return;
     const activeBand = effectiveActiveSession
@@ -354,7 +430,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     }
     fittedKey.current = key;
     dirtyRef.current = true;
-  }, [layout, mode, scopeProject, size, forest, effectiveActiveSession, direction]);
+  }, [layout, mode, scopeProject, size, forest, effectiveActiveSession, direction, nodeStyle]);
 
   // ───── RAF render loop ─────
   useEffect(() => {
@@ -410,6 +486,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             activeSessionId: effectiveActiveSession,
             liveTipId,
             nowMs: performance.now(),
+            nodeStyle,
           },
           cw,
           ch,
@@ -419,7 +496,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [layout, size, selected, hovered, mode, matches, forest, liveTipId, effectiveActiveSession]);
+  }, [layout, size, selected, hovered, mode, matches, forest, liveTipId, effectiveActiveSession, nodeStyle]);
 
   // ───── Mouse interactions ─────
   const dragRef = useRef<{ startX: number; startY: number; startTx: number; startTy: number; moved: boolean } | null>(null);
@@ -453,7 +530,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         dirtyRef.current = true;
       }
     } else if (layout) {
-      const hit = hitTest(layout, transformRef.current, e.clientX - rect.left, e.clientY - rect.top);
+      const hit = hitTest(layout, transformRef.current, e.clientX - rect.left, e.clientY - rect.top, nodeStyle);
       const next = hit ? { kind: hit.kind, id: hit.id } : null;
       const same = next && hovered && next.kind === hovered.kind && next.id === hovered.id;
       if (!same) {
@@ -471,7 +548,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     if (drag.moved) return;
     if (!layout) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const hit = hitTest(layout, transformRef.current, e.clientX - rect.left, e.clientY - rect.top);
+    const hit = hitTest(layout, transformRef.current, e.clientX - rect.left, e.clientY - rect.top, nodeStyle);
     if (!hit) return;
     if (hit.kind === "node") {
       setSelected(hit.id);
@@ -503,13 +580,13 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     const rect = e.currentTarget.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
-    const hit = hitTest(layout, transformRef.current, sx, sy);
+    const hit = hitTest(layout, transformRef.current, sx, sy, nodeStyle);
     setContextMenu({
       x: sx,
       y: sy,
       target: hit ? { kind: hit.kind, id: hit.id } : { kind: "empty" },
     });
-  }, [layout]);
+  }, [layout, nodeStyle]);
 
   // Dismiss context menu on any click outside it
   useEffect(() => {
@@ -926,6 +1003,21 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           </div>
         </div>
         <div className="pt-2 border-t border-zinc-800">
+          <div className="text-zinc-500 text-xs mb-1">Nodes</div>
+          <div className="flex gap-1">
+            {(["dots", "cards"] as const).map((s) => (
+              <button
+                key={s}
+                onClick={() => setNodeStyle(s)}
+                className={`px-2 py-1 rounded text-xs flex-1 ${nodeStyle === s ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+                title={s === "dots" ? "small dots — fast, good for overview" : "text cards — preview content in-place, layout is much larger"}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="pt-2 border-t border-zinc-800">
           <div className="text-zinc-500 text-xs mb-1">Input</div>
           <div className="flex gap-1">
             {(["auto", "mouse", "trackpad"] as const).map((m) => (
@@ -941,6 +1033,78 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               >
                 {m}
               </button>
+            ))}
+          </div>
+        </div>
+        {/* Spaces (top-level workspaces) */}
+        <div className="pt-2 border-t border-zinc-800">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-zinc-500 text-xs">Spaces</span>
+            <button
+              onClick={() => {
+                const name = window.prompt("Name this space:", "Untitled");
+                if (!name) return;
+                const sp: Space = {
+                  id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `s_${Date.now()}`,
+                  name,
+                  hue: Math.floor(Math.random() * 360),
+                  sessionIds: [],
+                  note: "",
+                  createdAt: new Date().toISOString(),
+                };
+                upsertSpace(sp);
+                setActiveSpaceId(sp.id);
+              }}
+              className="text-zinc-400 hover:text-zinc-200 text-xs"
+              title="new space"
+            >
+              + new
+            </button>
+          </div>
+          <div className="space-y-0.5">
+            {/* Special "All sessions" option */}
+            <button
+              onClick={() => setActiveSpaceId(null)}
+              className={`w-full text-left px-2 py-1 rounded text-xs flex items-center gap-2 ${activeSpaceId === null ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-900"}`}
+            >
+              <span className="inline-block w-2 h-2 rounded-sm shrink-0 bg-zinc-500" />
+              <span className="truncate flex-1">All sessions</span>
+              <span className="text-zinc-600 shrink-0">{forest.sessionCount}</span>
+            </button>
+            {spaces.map((sp) => (
+              <div key={sp.id} className="group flex items-center gap-1">
+                <button
+                  onClick={() => setActiveSpaceId(sp.id)}
+                  className={`flex-1 text-left px-2 py-1 rounded text-xs flex items-center gap-2 ${activeSpaceId === sp.id ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-900"}`}
+                  title={sp.note || sp.name}
+                >
+                  <span className="inline-block w-2 h-2 rounded-sm shrink-0" style={{ background: `hsl(${sp.hue}, 60%, 55%)` }} />
+                  <span className="truncate flex-1">{sp.name}</span>
+                  <span className="text-zinc-600 shrink-0">{sp.sessionIds.length}</span>
+                </button>
+                <button
+                  onClick={() => {
+                    const newName = window.prompt("Rename:", sp.name);
+                    if (newName == null) return;
+                    upsertSpace({ ...sp, name: newName });
+                  }}
+                  className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-zinc-200 text-xs px-0.5"
+                  title="rename"
+                >
+                  ✎
+                </button>
+                <button
+                  onClick={() => {
+                    if (window.confirm(`Delete space "${sp.name}"? (member sessions stay; only the grouping is removed)`)) {
+                      deleteSpace(sp.id);
+                    }
+                  }}
+                  className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-400 text-xs px-0.5"
+                  title="delete"
+                >
+                  ✕
+                </button>
+              </div>
             ))}
           </div>
         </div>
@@ -1281,6 +1445,10 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             layout={layout}
             forest={forest}
             size={size}
+            activeSpace={activeSpace}
+            spaces={spaces}
+            onAddToSpace={(sid, spId) => addSessionToSpace(sid, spId)}
+            onRemoveFromSpace={(sid, spId) => removeSessionFromSpace(sid, spId)}
             animateTo={animateTo}
             onZoomIn={() => {
               const t = transformRef.current;
@@ -1615,6 +1783,10 @@ function ContextMenuItems({
   layout,
   forest,
   size,
+  activeSpace,
+  spaces,
+  onAddToSpace,
+  onRemoveFromSpace,
   animateTo,
   onZoomIn,
   onZoomOut,
@@ -1629,6 +1801,10 @@ function ContextMenuItems({
   layout: Layout | null;
   forest: ForestPayload;
   size: { w: number; h: number };
+  activeSpace: Space | null;
+  spaces: Space[];
+  onAddToSpace: (sessionId: string, spaceId: string) => void;
+  onRemoveFromSpace: (sessionId: string, spaceId: string) => void;
   animateTo: (to: Transform, ms?: number) => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
@@ -1715,6 +1891,26 @@ function ContextMenuItems({
             label="Copy session ID"
             onClick={() => copy(sessionId)}
           />
+          {/* Add to space submenu */}
+          {spaces.length > 0 && (
+            <>
+              <MenuDivider />
+              {activeSpace && activeSpace.sessionIds.includes(sessionId) ? (
+                <MenuItem
+                  label={`✕ Remove from "${activeSpace.name}"`}
+                  onClick={() => { onRemoveFromSpace(sessionId, activeSpace.id); onClose(); }}
+                />
+              ) : (
+                spaces.map((sp) => (
+                  <MenuItem
+                    key={sp.id}
+                    label={`+ Add to "${sp.name}"`}
+                    onClick={() => { onAddToSpace(sessionId, sp.id); onClose(); }}
+                  />
+                ))
+              )}
+            </>
+          )}
         </>
       )}
       {target.kind === "node" && target.id && (
