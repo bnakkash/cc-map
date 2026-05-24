@@ -42,6 +42,39 @@ function extractUsage(record: RawRecord): NodeUsage | null {
   };
 }
 
+/** Info about an assistant's Task tool_use, used to attach subagents to their spawner. */
+export interface TaskSpawnHint {
+  sessionId: string;
+  /** UUID of the assistant turn that fired the Task call. */
+  uuid: string;
+  /** Timestamp of that assistant turn — matches the subagent's first message timestamp. */
+  timestamp: string;
+}
+
+export function extractTaskSpawn(line: string): TaskSpawnHint | null {
+  if (!line || line.length < 2) return null;
+  let r: RawRecord;
+  try {
+    r = JSON.parse(line) as RawRecord;
+  } catch {
+    return null;
+  }
+  if (r.type !== "assistant") return null;
+  if (typeof r.sessionId !== "string" || typeof r.uuid !== "string" || typeof r.timestamp !== "string") return null;
+  const content = (r.message as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) return null;
+  for (const b of content) {
+    if (b && typeof b === "object") {
+      const t = (b as { type?: unknown }).type;
+      const n = (b as { name?: unknown }).name;
+      if (t === "tool_use" && (n === "Task" || n === "Agent")) {
+        return { sessionId: r.sessionId, uuid: r.uuid, timestamp: r.timestamp };
+      }
+    }
+  }
+  return null;
+}
+
 /** Record-extracted session metadata (ai-title, tools used etc). null when none in this line. */
 export interface SessionSidecarHint {
   sessionId: string;

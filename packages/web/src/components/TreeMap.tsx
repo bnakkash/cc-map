@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import "highlight.js/styles/github-dark.css";
 import { api, type NodeResponse } from "../api.js";
 import { useSse, type SseEvent } from "../sse.js";
 import { useStore } from "../store.js";
@@ -644,6 +646,9 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     return () => { cancelled = true; };
   }, [selected, forest]);
 
+  // Gmail-style chord state: when `g` is pressed, the next key within 1.5s is interpreted as a chord
+  const chordRef = useRef<{ pending: boolean; timer: number | null }>({ pending: false, timer: null });
+
   // ───── Keyboard ─────
   useEffect(() => {
     // Find the visible nodes in a session, sorted by timestamp.
@@ -697,6 +702,65 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
         e.preventDefault();
         navigateBy(-1);
+        return;
+      }
+      // Gmail-style `g` chord: g then v/m/b/s/f
+      if (chordRef.current.pending) {
+        chordRef.current.pending = false;
+        if (chordRef.current.timer) {
+          window.clearTimeout(chordRef.current.timer);
+          chordRef.current.timer = null;
+        }
+        e.preventDefault();
+        switch (e.key) {
+          case "v": onClose(); return; // back to viewer
+          case "m": return; // already in map; no-op
+          case "b": {
+            const first = [...bookmarks][0];
+            if (first && layout) {
+              setSelected(first);
+              const ln = layout.nodes.get(first);
+              if (ln) {
+                const t = transformRef.current;
+                const sc = Math.max(t.scale, 1.5);
+                animateTo({ scale: sc, tx: size.w / 2 - ln.x * sc, ty: size.h / 2 - ln.y * sc }, 250);
+              }
+            }
+            return;
+          }
+          case "s":
+          case "/":
+            setSearchOpen(true);
+            return;
+          case "h":
+          case "f":
+            if (layout) animateTo(fitTransform(layout, size.w, size.h));
+            return;
+          case "l": {
+            // jump to live tip — same as spacebar
+            if (liveTipId && layout) {
+              const ln = layout.nodes.get(liveTipId);
+              if (ln) {
+                const t = transformRef.current;
+                const sc = Math.max(t.scale, 1.5);
+                animateTo({ scale: sc, tx: size.w / 2 - ln.x * sc, ty: size.h / 2 - ln.y * sc }, 250);
+                setSelected(liveTipId);
+              }
+            }
+            return;
+          }
+          default:
+            return;
+        }
+      }
+      if (e.key === "g") {
+        e.preventDefault();
+        chordRef.current.pending = true;
+        if (chordRef.current.timer) window.clearTimeout(chordRef.current.timer);
+        chordRef.current.timer = window.setTimeout(() => {
+          chordRef.current.pending = false;
+          chordRef.current.timer = null;
+        }, 1500);
         return;
       }
       // b: toggle bookmark on the selected node
@@ -962,10 +1026,29 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           <VisToggle label="System reminders" color="#3f3f46" on={visibility.systemReminder} onChange={() => toggleVisibility("systemReminder")} />
         </div>
         <div className="text-xs text-zinc-500 pt-2 border-t border-zinc-800 space-y-1">
+          {/* Quick reset */}
+          {(filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly ||
+            JSON.stringify(visibility) !== JSON.stringify(DEFAULT_VISIBILITY)) && (
+            <button
+              onClick={() => {
+                updateFilter({ startDate: null, endDate: null, requiredTools: [], bookmarkedOnly: false });
+                setVisibility(DEFAULT_VISIBILITY);
+                try {
+                  localStorage.setItem("cc-map-visibility", JSON.stringify(DEFAULT_VISIBILITY));
+                } catch {}
+              }}
+              className="w-full text-left text-xs text-zinc-400 hover:text-zinc-100 underline mb-1"
+              title="reset all visibility + filter settings"
+            >
+              ↺ reset filters & visibility
+            </button>
+          )}
           {effectiveActiveSession && (() => {
             const liveBand = layout?.sessionBands.find((b) => b.sessionId === effectiveActiveSession);
             const liveProj = forest.nodes.find((n) => n.sessionId === effectiveActiveSession)?.projectSlug ?? "";
             const liveTitle = forest.sessionTitles?.[effectiveActiveSession]?.aiTitle;
+            // Latest meaningful message preview — show what just happened
+            const latestNode = liveTipId ? forest.nodes.find((n) => n.id === liveTipId) : null;
             return (
               <button
                 className="flex flex-col items-start gap-1 w-full text-left p-2 -mx-1 rounded hover:bg-zinc-900 border border-emerald-900/40"
@@ -992,6 +1075,14 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                   <div className="text-zinc-300 text-xs font-mono">{effectiveActiveSession.slice(0, 8)}</div>
                 )}
                 <div className="text-zinc-500 text-[10px] truncate w-full" title={liveProj}>{prettySlug(liveProj)}</div>
+                {latestNode && (
+                  <div className="text-zinc-400 text-[10px] line-clamp-2 leading-tight w-full pt-1 border-t border-zinc-800/60 mt-1">
+                    <span className={latestNode.role === "assistant" ? "text-amber-400" : "text-emerald-400"}>
+                      {latestNode.role === "assistant" ? "→ " : "← "}
+                    </span>
+                    {latestNode.preview || "(no preview)"}
+                  </div>
+                )}
               </button>
             );
           })()}
@@ -1266,6 +1357,13 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             <KbdGroup title="CLI integration (right-click any node)">
               <KbdRow keys={["right-click"]} desc="resume / fork / copy command for that session" />
             </KbdGroup>
+            <KbdGroup title="Chord shortcuts (press g, then…)">
+              <KbdRow keys={["g", "v"]} desc="back to viewer" />
+              <KbdRow keys={["g", "b"]} desc="jump to first bookmark" />
+              <KbdRow keys={["g", "s"]} desc="open search" />
+              <KbdRow keys={["g", "f"]} desc="fit all" />
+              <KbdRow keys={["g", "l"]} desc="jump to live tip" />
+            </KbdGroup>
             <KbdGroup title="Search & navigation">
               <KbdRow keys={["/"]} desc="search messages" />
               <KbdRow keys={["enter"]} desc="(in search) fit to matches" />
@@ -1438,7 +1536,7 @@ function ContentRender({ data }: { data: NodeResponse }) {
   if (typeof content === "string") {
     return (
       <div className="md-body text-zinc-200">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{content}</ReactMarkdown>
       </div>
     );
   }
@@ -1458,7 +1556,7 @@ function BlockRender({ block }: { block: unknown }) {
   }
   const b = block as { type?: string; text?: string; name?: string; input?: unknown; content?: unknown };
   if (b.type === "text" && typeof b.text === "string") {
-    return <div className="md-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{b.text}</ReactMarkdown></div>;
+    return <div className="md-body"><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{b.text}</ReactMarkdown></div>;
   }
   if (b.type === "tool_use") {
     return (

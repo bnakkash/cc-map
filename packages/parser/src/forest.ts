@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { extractSidecarHint, parseFile } from "./jsonl.js";
+import { extractSidecarHint, extractTaskSpawn, parseFile, parseLineToNode } from "./jsonl.js";
 import type { Forest, ForkInfo, GraphNode, SessionMeta } from "./types.js";
 
 interface SidecarAggregate {
@@ -266,23 +266,66 @@ export function buildForest(nodes: Iterable<GraphNode>): Forest {
 
 /**
  * High-level: discover + parse + build forest. Convenience for one-shot use.
+ *
+ * Subagent attachment: each subagent file's first message has `parentUuid: null`
+ * but its `sessionId` + `timestamp` match the spawning assistant's Task tool_use
+ * in the parent session file. We build a spawn index during parsing and rewrite
+ * the subagent root's parentId so the forest reflects the actual conversation
+ * graph (instead of subagents floating as orphan roots).
  */
 export async function loadForest(projectsRoot: string): Promise<Forest> {
   const files = await discoverFiles(projectsRoot);
   const allNodes: GraphNode[] = [];
+  // sessionId -> assistant turns that fired a Task call
+  const spawnIndex = new Map<string, { uuid: string; timestamp: string }[]>();
   await Promise.all(
     files.map(async (f) => {
       try {
-        const nodes = await parseFile(f.filePath, {
-          projectSlug: f.projectSlug,
-          sessionId: f.sessionId,
-        });
-        allNodes.push(...nodes);
+        const text = await readFile(f.filePath, "utf8");
+        for (const line of text.split(/\r?\n/)) {
+          const node = parseLineToNode(line, { projectSlug: f.projectSlug, sessionId: f.sessionId });
+          if (node) allNodes.push(node);
+          const spawn = extractTaskSpawn(line);
+          if (spawn) {
+            let arr = spawnIndex.get(spawn.sessionId);
+            if (!arr) {
+              arr = [];
+              spawnIndex.set(spawn.sessionId, arr);
+            }
+            arr.push({ uuid: spawn.uuid, timestamp: spawn.timestamp });
+          }
+        }
       } catch {
         // skip unreadable files
       }
     }),
   );
+
+  // Attach subagent roots to spawning assistants. Match by sessionId + timestamp
+  // (within a 5-second tolerance; spawning Task call writes both records nearly simultaneously).
+  let attachedCount = 0;
+  for (const n of allNodes) {
+    if (!n.isSidechain || n.parentId !== null) continue;
+    const spawns = spawnIndex.get(n.sessionId);
+    if (!spawns) continue;
+    let best: { uuid: string; diffMs: number } | null = null;
+    const nodeTs = new Date(n.timestamp).getTime();
+    for (const s of spawns) {
+      const diff = Math.abs(new Date(s.timestamp).getTime() - nodeTs);
+      if (diff < 5000 && (!best || diff < best.diffMs)) {
+        best = { uuid: s.uuid, diffMs: diff };
+      }
+    }
+    if (best && best.uuid !== n.id) {
+      n.parentId = best.uuid;
+      attachedCount += 1;
+    }
+  }
+  if (attachedCount > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`[loadForest] attached ${attachedCount} subagent root(s) to spawning Task assistants`);
+  }
+
   const forest = buildForest(allNodes);
   // Backfill filePath on session metas
   for (const f of files) {

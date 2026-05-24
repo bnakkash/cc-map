@@ -130,31 +130,36 @@ export function buildLayout(
     return na.timestamp.localeCompare(nb.timestamp);
   });
 
-  // Compute subtree widths (memoized DFS)
+  // ───── Grid mode: VERTICAL stacking of fork siblings ─────
+  // Each tree stays narrow (children of the same parent stack below each other
+  // rather than fanning side-by-side). Subsequent siblings are offset slightly
+  // to the right of the spine so edges can be traced visually.
+  //
+  // Width(node) = max(child widths + per-sibling offset)
+  // Height(node) = nodeSpacingV (own row) + sum(child heights)
+  const SIBLING_X_OFFSET: number = LAYOUT.nodeSpacingH;
   const subtreeWidth = new Map<string, number>();
-  const visited = new Set<string>();
+  const subtreeHeight = new Map<string, number>();
+  const widthVisited = new Set<string>();
+  const heightVisited = new Set<string>();
   const computeWidth = (id: string): number => {
     if (subtreeWidth.has(id)) return subtreeWidth.get(id)!;
-    if (visited.has(id)) return LAYOUT.nodeSpacingH; // cycle defense
-    visited.add(id);
+    if (widthVisited.has(id)) return LAYOUT.nodeSpacingH;
+    widthVisited.add(id);
     const kids = sortedChildren.get(id);
     if (!kids || kids.length === 0) {
       subtreeWidth.set(id, LAYOUT.nodeSpacingH);
       return LAYOUT.nodeSpacingH;
     }
-    let total = 0;
-    for (const k of kids) total += computeWidth(k);
-    total += (kids.length - 1) * 0; // children are immediately adjacent
-    subtreeWidth.set(id, Math.max(total, LAYOUT.nodeSpacingH));
+    let maxKidWidth: number = LAYOUT.nodeSpacingH;
+    for (let i = 0; i < kids.length; i++) {
+      const kw = computeWidth(kids[i]!);
+      const candidate = kw + i * SIBLING_X_OFFSET;
+      if (candidate > maxKidWidth) maxKidWidth = candidate;
+    }
+    subtreeWidth.set(id, maxKidWidth);
     return subtreeWidth.get(id)!;
   };
-  for (const r of roots) computeWidth(r);
-
-  // Compute subtree HEIGHTS (depth × spacing) so we can pick a row-wrap target
-  // that produces a roughly square overall layout. Without wrapping, 60+ sessions
-  // pack into one wide horizontal strip.
-  const subtreeHeight = new Map<string, number>();
-  const heightVisited = new Set<string>();
   const computeHeight = (id: string): number => {
     if (subtreeHeight.has(id)) return subtreeHeight.get(id)!;
     if (heightVisited.has(id)) return LAYOUT.nodeSpacingV;
@@ -164,15 +169,17 @@ export function buildLayout(
       subtreeHeight.set(id, LAYOUT.nodeSpacingV);
       return LAYOUT.nodeSpacingV;
     }
-    let maxKid = 0;
+    let totalKidHeight = 0;
     for (const k of kids) {
-      const kh = computeHeight(k);
-      if (kh > maxKid) maxKid = kh;
+      totalKidHeight += computeHeight(k);
     }
-    subtreeHeight.set(id, maxKid + LAYOUT.nodeSpacingV);
+    subtreeHeight.set(id, LAYOUT.nodeSpacingV + totalKidHeight);
     return subtreeHeight.get(id)!;
   };
-  for (const r of roots) computeHeight(r);
+  for (const r of roots) {
+    computeWidth(r);
+    computeHeight(r);
+  }
 
   // ───── Column-mode layout: prompt spine vertical, side chains right ─────
   // Each visible prompt sits in a vertical column at x = sessionBaseX.
@@ -369,59 +376,55 @@ export function buildLayout(
   const layoutNodes = new Map<string, LayoutNode>();
   const edges: LayoutEdge[] = [];
 
-  let cursorX = 0;
+  // ───── Macro layout: SESSIONS stack vertically ─────
+  // Each root tree is placed at x=0 and cursorY advances by its height.
+  // Roots from the same session are contiguous (because of root sort order),
+  // so a session forms a vertical block. Projects separated by projectGap.
   let cursorY = mode === "all-projects" ? LAYOUT.projectLabelHeight : 0;
-  let rowMaxHeight = 0;
   let lastProject: string | null = null;
-
-  const newRow = () => {
-    cursorY += rowMaxHeight + LAYOUT.rowGap;
-    cursorX = 0;
-    rowMaxHeight = 0;
-  };
+  let lastSession: string | null = null;
+  void targetRowWidth;
 
   for (const rootId of roots) {
     const rootNode = nodeMap.get(rootId)!;
     const rootWidth = subtreeWidth.get(rootId)!;
     const rootHeight = subtreeHeight.get(rootId)!;
-    // Project boundary in all-projects mode → force new row + add project gap
+    // Project boundary in all-projects mode
     if (lastProject !== null && rootNode.projectSlug !== lastProject) {
-      if (mode === "all-projects") {
-        newRow();
-        cursorY += LAYOUT.projectGap;
-      }
+      if (mode === "all-projects") cursorY += LAYOUT.projectGap;
+    }
+    // Session boundary within same project — small gap between sessions
+    if (lastSession !== null && rootNode.sessionId !== lastSession) {
+      cursorY += LAYOUT.treeGap;
     }
     lastProject = rootNode.projectSlug;
-    // No within-project wrap: trees flow continuously as one row per project.
-    // Project boundaries still force newRow() above. User can pan/zoom horizontally.
-    void rootWidth; void targetRowWidth;
-    placeTree(rootId, cursorX, cursorY, {
+    lastSession = rootNode.sessionId;
+
+    placeTree(rootId, 0, cursorY, {
       nodeMap,
       sortedChildren,
       subtreeWidth,
+      subtreeHeight,
       layoutNodes,
       edges,
       forkParents,
       payloadIndex: payload,
     });
-    // Track project band — needs minY/maxY too so hulls only cover the project's
-    // actual Y range, not the full layout height (which would make all hulls overlap).
+
+    // Project band: track the y-range that this project occupies + max width
     const band = projectBands.get(rootNode.projectSlug);
     if (!band) {
       projectBands.set(rootNode.projectSlug, {
-        minX: cursorX,
-        maxX: cursorX + rootWidth,
+        minX: 0,
+        maxX: rootWidth,
         minY: cursorY,
         maxY: cursorY + rootHeight,
       });
     } else {
-      band.minX = Math.min(band.minX, cursorX);
-      band.maxX = Math.max(band.maxX, cursorX + rootWidth);
-      band.minY = Math.min(band.minY, cursorY);
-      band.maxY = Math.max(band.maxY, cursorY + rootHeight);
+      band.maxX = Math.max(band.maxX, rootWidth);
+      band.maxY = cursorY + rootHeight;
     }
-    cursorX += rootWidth + LAYOUT.treeGap;
-    if (rootHeight > rowMaxHeight) rowMaxHeight = rootHeight;
+    cursorY += rootHeight + LAYOUT.nodeSpacingV;
   }
 
   // Compute bounds
@@ -581,6 +584,7 @@ function placeTree(
     nodeMap: Map<string, ForestNode>;
     sortedChildren: Map<string, string[]>;
     subtreeWidth: Map<string, number>;
+    subtreeHeight: Map<string, number>;
     layoutNodes: Map<string, LayoutNode>;
     edges: LayoutEdge[];
     forkParents: Set<string>;
@@ -590,11 +594,9 @@ function placeTree(
   const node = ctx.nodeMap.get(id);
   if (!node) return;
   if (ctx.layoutNodes.has(id)) return;
-  const myWidth = ctx.subtreeWidth.get(id)!;
-  const centerX = xLeft + myWidth / 2;
   const layoutNode: LayoutNode = {
     id,
-    x: centerX,
+    x: xLeft,
     y: yTop,
     projectSlug: node.projectSlug,
     sessionId: node.sessionId,
@@ -609,15 +611,21 @@ function placeTree(
 
   const kids = ctx.sortedChildren.get(id);
   if (!kids || kids.length === 0) return;
-  let cx = xLeft;
-  for (const kid of kids) {
-    const kw = ctx.subtreeWidth.get(kid)!;
-    placeTree(kid, cx, yTop + LAYOUT.nodeSpacingV, ctx);
+
+  // Vertical stacking: first child directly below parent (continues the spine);
+  // subsequent siblings step right by SIBLING_X_OFFSET so their branches are
+  // distinguishable from the spine and edges have somewhere to curve to.
+  let cy = yTop + LAYOUT.nodeSpacingV;
+  for (let i = 0; i < kids.length; i++) {
+    const kid = kids[i]!;
+    const kh = ctx.subtreeHeight.get(kid)!;
+    const cx = xLeft + i * LAYOUT.nodeSpacingH;
+    placeTree(kid, cx, cy, ctx);
     ctx.edges.push({
       fromId: id,
       toId: kid,
       isFork: kids.length > 1,
     });
-    cx += kw;
+    cy += kh;
   }
 }

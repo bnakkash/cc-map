@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getToken, type ChipItem } from "./api.js";
+import { Calendar } from "./components/Calendar.js";
 import { ChipColumn } from "./components/ChipColumn.js";
 import { MessagePane } from "./components/MessagePane.js";
 import { SessionPicker } from "./components/SessionPicker.js";
@@ -7,7 +8,7 @@ import { TreeMap } from "./components/TreeMap.js";
 import { useSse } from "./sse.js";
 import { useStore } from "./store.js";
 
-type ViewName = "viewer" | "map";
+type ViewName = "viewer" | "map" | "calendar";
 
 export default function App() {
   const loadSessions = useStore((s) => s.loadSessions);
@@ -82,11 +83,17 @@ export default function App() {
           >
             map
           </button>
+          <button
+            onClick={() => setView("calendar")}
+            className={`px-2 py-1 rounded text-xs ${view === "calendar" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+          >
+            calendar
+          </button>
         </div>
         {view === "viewer" && <SessionPicker />}
         <div className="ml-auto text-xs text-zinc-500">
           {error && <span className="text-red-400 mr-3">{error}</span>}
-          {view === "viewer" ? "phase 1 · viewer" : "phase 2 · tree-map"}
+          {view === "viewer" ? "phase 1 · viewer" : view === "map" ? "phase 2 · tree-map" : "phase 3 · calendar"}
         </div>
       </header>
       <main className="flex-1 flex overflow-hidden">
@@ -95,8 +102,26 @@ export default function App() {
             <ChipColumn />
             <MessagePane />
           </>
-        ) : (
+        ) : view === "map" ? (
           <TreeMap onClose={() => setView("viewer")} />
+        ) : (
+          <Calendar
+            onSelectDay={(iso) => {
+              // Pre-set the map's date filter so it lands on just that day
+              try {
+                const cur = JSON.parse(localStorage.getItem("cc-map-filter") ?? "{}");
+                localStorage.setItem(
+                  "cc-map-filter",
+                  JSON.stringify({ ...cur, startDate: iso, endDate: iso }),
+                );
+              } catch {}
+              setView("map");
+            }}
+            onSelectSession={(sid) => {
+              void useStore.getState().selectSession(sid);
+              setView("viewer");
+            }}
+          />
         )}
       </main>
     </div>
