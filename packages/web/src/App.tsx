@@ -1,10 +1,13 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { getToken, type ChipItem } from "./api.js";
 import { ChipColumn } from "./components/ChipColumn.js";
 import { MessagePane } from "./components/MessagePane.js";
 import { SessionPicker } from "./components/SessionPicker.js";
+import { TreeMap } from "./components/TreeMap.js";
 import { useSse } from "./sse.js";
 import { useStore } from "./store.js";
+
+type ViewName = "viewer" | "map";
 
 export default function App() {
   const loadSessions = useStore((s) => s.loadSessions);
@@ -12,6 +15,7 @@ export default function App() {
   const setActiveSession = useStore((s) => s.setActiveSession);
   const selectedSessionId = useStore((s) => s.selectedSessionId);
   const error = useStore((s) => s.error);
+  const [view, setView] = useState<ViewName>("viewer");
 
   useEffect(() => {
     void loadSessions();
@@ -65,15 +69,35 @@ export default function App() {
     <div className="h-full flex flex-col">
       <header className="border-b border-zinc-800 bg-zinc-900/50 px-4 py-2 flex items-center gap-4">
         <div className="font-mono text-sm font-semibold text-zinc-300">cc-map</div>
-        <SessionPicker />
+        <div className="flex gap-1">
+          <button
+            onClick={() => setView("viewer")}
+            className={`px-2 py-1 rounded text-xs ${view === "viewer" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+          >
+            viewer
+          </button>
+          <button
+            onClick={() => setView("map")}
+            className={`px-2 py-1 rounded text-xs ${view === "map" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+          >
+            map
+          </button>
+        </div>
+        {view === "viewer" && <SessionPicker />}
         <div className="ml-auto text-xs text-zinc-500">
           {error && <span className="text-red-400 mr-3">{error}</span>}
-          phase 1 · viewer
+          {view === "viewer" ? "phase 1 · viewer" : "phase 2 · tree-map"}
         </div>
       </header>
       <main className="flex-1 flex overflow-hidden">
-        <ChipColumn />
-        <MessagePane />
+        {view === "viewer" ? (
+          <>
+            <ChipColumn />
+            <MessagePane />
+          </>
+        ) : (
+          <TreeMap onClose={() => setView("viewer")} />
+        )}
       </main>
     </div>
   );

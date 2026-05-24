@@ -40,6 +40,51 @@ fastify.options("/*", async (_req, reply) => reply.send());
 
 fastify.get("/api/health", async () => ({ ok: true, version: "0.0.1" }));
 
+/**
+ * GET /api/forest — lightweight whole-forest topology for the tree-map view.
+ * Excludes full message content (only preview ≤ 80 chars) to keep the payload
+ * manageable. ~7-10MB for ~40k nodes. Compressed by Fastify if Accept-Encoding allows.
+ */
+fastify.get("/api/forest", async () => {
+  const nodes: Array<{
+    id: string;
+    parentId: string | null;
+    sessionId: string;
+    projectSlug: string;
+    role: "user" | "assistant";
+    subtype: string | null;
+    isSidechain: boolean;
+    timestamp: string;
+    preview: string;
+    sessionsIn: number;
+  }> = [];
+  for (const n of state.forest.nodes.values()) {
+    const sessIn = state.forest.sessionsContainingNode.get(n.id);
+    nodes.push({
+      id: n.id,
+      parentId: n.parentId,
+      sessionId: n.sessionId,
+      projectSlug: n.projectSlug,
+      role: n.classification.role,
+      subtype: n.classification.role === "user" ? n.classification.subtype : null,
+      isSidechain: n.isSidechain,
+      timestamp: n.timestamp,
+      preview: n.preview.slice(0, 80),
+      sessionsIn: sessIn ? sessIn.length : 1,
+    });
+  }
+  const projects = [...state.forest.sessionsByProject.entries()].map(([slug, sids]) => ({
+    slug,
+    sessionCount: sids.length,
+  }));
+  return {
+    nodes,
+    forks: state.forest.forks,
+    projects,
+    sessionCount: state.forest.sessions.size,
+  };
+});
+
 fastify.get("/api/sessions", async () => {
   const list = [...state.forest.sessions.values()].map((s) => ({
     sessionId: s.sessionId,
