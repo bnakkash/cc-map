@@ -1,7 +1,25 @@
-import { readdir, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { parseFile } from "./jsonl.js";
+import { extractSidecarHint, parseFile } from "./jsonl.js";
 import type { Forest, ForkInfo, GraphNode, SessionMeta } from "./types.js";
+
+/** Walk a file once to extract sidecar info (ai-title etc) that isn't a graph node. */
+async function extractSidecars(filePath: string): Promise<Map<string, { aiTitle?: string }>> {
+  const out = new Map<string, { aiTitle?: string }>();
+  try {
+    const text = await readFile(filePath, "utf8");
+    for (const line of text.split(/\r?\n/)) {
+      const hint = extractSidecarHint(line);
+      if (!hint) continue;
+      const cur = out.get(hint.sessionId) ?? {};
+      if (hint.aiTitle) cur.aiTitle = hint.aiTitle;
+      out.set(hint.sessionId, cur);
+    }
+  } catch {
+    // skip
+  }
+  return out;
+}
 
 export interface DiscoveredFile {
   filePath: string;
@@ -140,6 +158,13 @@ export function buildForest(nodes: Iterable<GraphNode>): Forest {
         cwd: node.cwd,
         nodeCount: 1,
         promptCount: isPrompt ? 1 : 0,
+        aiTitle: null,
+        totalUsage: {
+          inputTokens: node.usage?.inputTokens ?? 0,
+          outputTokens: node.usage?.outputTokens ?? 0,
+          cacheReadTokens: node.usage?.cacheReadTokens ?? 0,
+          cacheCreationTokens: node.usage?.cacheCreationTokens ?? 0,
+        },
       });
     } else {
       existing.nodeCount += 1;
@@ -151,6 +176,12 @@ export function buildForest(nodes: Iterable<GraphNode>): Forest {
         existing.lastActivityAt = node.timestamp;
       }
       if (!existing.cwd && node.cwd) existing.cwd = node.cwd;
+      if (node.usage) {
+        existing.totalUsage.inputTokens += node.usage.inputTokens;
+        existing.totalUsage.outputTokens += node.usage.outputTokens;
+        existing.totalUsage.cacheReadTokens += node.usage.cacheReadTokens;
+        existing.totalUsage.cacheCreationTokens += node.usage.cacheCreationTokens;
+      }
     }
   }
 
@@ -241,12 +272,22 @@ export async function loadForest(projectsRoot: string): Promise<Forest> {
     }),
   );
   const forest = buildForest(allNodes);
-  // backfill filePath on session metas
+  // Backfill filePath on session metas
   for (const f of files) {
     if (f.isSidechain) continue;
     const meta = forest.sessions.get(f.sessionId);
     if (meta && !meta.filePath) meta.filePath = f.filePath;
   }
+  // Backfill aiTitle by scanning every file once for sidecar records
+  await Promise.all(
+    files.map(async (f) => {
+      const hints = await extractSidecars(f.filePath);
+      for (const [sid, h] of hints) {
+        const meta = forest.sessions.get(sid);
+        if (meta && h.aiTitle && !meta.aiTitle) meta.aiTitle = h.aiTitle;
+      }
+    }),
+  );
   return forest;
 }
 

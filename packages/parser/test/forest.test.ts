@@ -16,6 +16,7 @@ function node(over: Partial<GraphNode> & Pick<GraphNode, "id" | "sessionId" | "t
     agentId: over.agentId ?? null,
     preview: over.preview ?? "",
     contentLength: over.contentLength ?? 0,
+    usage: over.usage ?? null,
   };
 }
 

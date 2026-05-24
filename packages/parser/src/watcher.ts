@@ -129,8 +129,21 @@ function aggregateSessions(nodes: GraphNode[]): SessionMeta[] {
         cwd: n.cwd,
         nodeCount: 1,
         promptCount: isPrompt ? 1 : 0,
+        aiTitle: null,
+        totalUsage: {
+          inputTokens: n.usage?.inputTokens ?? 0,
+          outputTokens: n.usage?.outputTokens ?? 0,
+          cacheReadTokens: n.usage?.cacheReadTokens ?? 0,
+          cacheCreationTokens: n.usage?.cacheCreationTokens ?? 0,
+        },
       });
     } else {
+      if (n.usage) {
+        existing.totalUsage.inputTokens += n.usage.inputTokens;
+        existing.totalUsage.outputTokens += n.usage.outputTokens;
+        existing.totalUsage.cacheReadTokens += n.usage.cacheReadTokens;
+        existing.totalUsage.cacheCreationTokens += n.usage.cacheCreationTokens;
+      }
       existing.nodeCount += 1;
       if (isPrompt) existing.promptCount += 1;
       if (!existing.lastActivityAt || n.timestamp > existing.lastActivityAt) {

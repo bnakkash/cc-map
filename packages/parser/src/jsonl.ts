@@ -1,7 +1,51 @@
 import { readFile } from "node:fs/promises";
 import { open } from "node:fs/promises";
 import { classify, extractPreview } from "./classifier.js";
-import type { GraphNode, RawRecord } from "./types.js";
+import type { GraphNode, NodeUsage, RawRecord } from "./types.js";
+
+/** Pull token usage from an assistant record. Returns null for non-assistant or missing data. */
+function extractUsage(record: RawRecord): NodeUsage | null {
+  if (record.type !== "assistant") return null;
+  const msg = record.message as { usage?: unknown } | undefined;
+  const u = msg?.usage as
+    | {
+        input_tokens?: number;
+        output_tokens?: number;
+        cache_read_input_tokens?: number;
+        cache_creation_input_tokens?: number;
+      }
+    | undefined;
+  if (!u) return null;
+  return {
+    inputTokens: typeof u.input_tokens === "number" ? u.input_tokens : 0,
+    outputTokens: typeof u.output_tokens === "number" ? u.output_tokens : 0,
+    cacheReadTokens: typeof u.cache_read_input_tokens === "number" ? u.cache_read_input_tokens : 0,
+    cacheCreationTokens: typeof u.cache_creation_input_tokens === "number" ? u.cache_creation_input_tokens : 0,
+  };
+}
+
+/** Record-extracted session metadata (ai-title etc). null when none in this line. */
+export interface SessionSidecarHint {
+  sessionId: string;
+  aiTitle?: string;
+}
+
+export function extractSidecarHint(line: string): SessionSidecarHint | null {
+  if (!line || line.length < 2) return null;
+  let r: RawRecord;
+  try {
+    r = JSON.parse(line) as RawRecord;
+  } catch {
+    return null;
+  }
+  if (r.type === "ai-title" && typeof r.sessionId === "string") {
+    const title = (r as { aiTitle?: unknown }).aiTitle;
+    const out: SessionSidecarHint = { sessionId: r.sessionId };
+    if (typeof title === "string") out.aiTitle = title;
+    return out;
+  }
+  return null;
+}
 
 /** Set of `type` values that produce graph nodes. Everything else is metadata. */
 const GRAPH_TYPES = new Set(["user", "assistant"]);
@@ -44,6 +88,7 @@ export function parseLineToNode(
     agentId: typeof record.agentId === "string" ? record.agentId : null,
     preview,
     contentLength: length,
+    usage: extractUsage(record),
   };
 }
 

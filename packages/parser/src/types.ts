@@ -36,6 +36,13 @@ export interface RawRecord {
   [k: string]: unknown;
 }
 
+export interface NodeUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+}
+
 export interface GraphNode {
   /** UUID of this record. Globally unique across Claude Code's data. */
   id: string;
@@ -61,6 +68,8 @@ export interface GraphNode {
   preview: string;
   /** Length in characters of the full message text, for sizing/sorting. */
   contentLength: number;
+  /** Token usage (assistant turns only). */
+  usage: NodeUsage | null;
 }
 
 export interface SessionMeta {
@@ -77,6 +86,10 @@ export interface SessionMeta {
   nodeCount: number;
   /** Number of real prompts (excluding slash commands and tool results). */
   promptCount: number;
+  /** Claude-generated session title from `type: "ai-title"` records, if any. */
+  aiTitle: string | null;
+  /** Sum of token usage across all assistant turns in this session. */
+  totalUsage: NodeUsage;
 }
 
 export interface ForkInfo {

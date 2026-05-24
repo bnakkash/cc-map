@@ -9,6 +9,20 @@ export interface ForestNode {
   timestamp: string;
   preview: string;
   sessionsIn: number;
+  /** Assistant output tokens (0 otherwise). Used for sparkline. */
+  outputTokens: number;
+}
+
+export interface SessionTokens {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreation: number;
+}
+
+export interface SessionTitleInfo {
+  aiTitle: string | null;
+  tokens: SessionTokens;
 }
 
 export interface ForkInfo {
@@ -19,6 +33,7 @@ export interface ForkInfo {
 export interface ProjectMeta {
   slug: string;
   sessionCount: number;
+  tokens: SessionTokens;
 }
 
 export interface ForestPayload {
@@ -29,6 +44,8 @@ export interface ForestPayload {
   /** The currently-active Claude Code session (from SessionStart hook, or most-recent fallback). */
   activeSessionId: string | null;
   activeSessionAt: string | null;
+  /** Per-session metadata: ai-title + total token usage. Keyed by sessionId. */
+  sessionTitles: Record<string, SessionTitleInfo>;
 }
 
 export interface LayoutNode {

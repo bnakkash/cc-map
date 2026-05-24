@@ -5,6 +5,7 @@ export type {
   Forest,
   GraphNode,
   NodeClassification,
+  NodeUsage,
   RawRecord,
   SessionMeta,
   UserSubtype,

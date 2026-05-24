@@ -57,6 +57,8 @@ fastify.get("/api/forest", async () => {
     timestamp: string;
     preview: string;
     sessionsIn: number;
+    /** Output tokens for assistant turns (0 otherwise). Used for sparkline. */
+    outputTokens: number;
   }> = [];
   for (const n of state.forest.nodes.values()) {
     const sessIn = state.forest.sessionsContainingNode.get(n.id);
@@ -71,12 +73,35 @@ fastify.get("/api/forest", async () => {
       timestamp: n.timestamp,
       preview: n.preview.slice(0, 80),
       sessionsIn: sessIn ? sessIn.length : 1,
+      outputTokens: n.usage?.outputTokens ?? 0,
     });
   }
-  const projects = [...state.forest.sessionsByProject.entries()].map(([slug, sids]) => ({
-    slug,
-    sessionCount: sids.length,
-  }));
+  const projects = [...state.forest.sessionsByProject.entries()].map(([slug, sids]) => {
+    const projectMetas = sids
+      .map((sid) => state.forest.sessions.get(sid))
+      .filter((m): m is NonNullable<typeof m> => m != null);
+    const totalInput = projectMetas.reduce((s, m) => s + m.totalUsage.inputTokens, 0);
+    const totalOutput = projectMetas.reduce((s, m) => s + m.totalUsage.outputTokens, 0);
+    const totalCacheRead = projectMetas.reduce((s, m) => s + m.totalUsage.cacheReadTokens, 0);
+    const totalCacheCreate = projectMetas.reduce((s, m) => s + m.totalUsage.cacheCreationTokens, 0);
+    return {
+      slug,
+      sessionCount: sids.length,
+      tokens: { input: totalInput, output: totalOutput, cacheRead: totalCacheRead, cacheCreation: totalCacheCreate },
+    };
+  });
+  const sessionTitles: Record<string, { aiTitle: string | null; tokens: { input: number; output: number; cacheRead: number; cacheCreation: number } }> = {};
+  for (const m of state.forest.sessions.values()) {
+    sessionTitles[m.sessionId] = {
+      aiTitle: m.aiTitle,
+      tokens: {
+        input: m.totalUsage.inputTokens,
+        output: m.totalUsage.outputTokens,
+        cacheRead: m.totalUsage.cacheReadTokens,
+        cacheCreation: m.totalUsage.cacheCreationTokens,
+      },
+    };
+  }
   // "Active session": prefer the one registered by the SessionStart hook.
   // Fall back to the most-recently-touched session (works without the hook).
   const hookActive = state.getActiveSession();
@@ -97,6 +122,7 @@ fastify.get("/api/forest", async () => {
     sessionCount: state.forest.sessions.size,
     activeSessionId,
     activeSessionAt: hookActive.at,
+    sessionTitles,
   };
 });
 
@@ -176,6 +202,51 @@ fastify.get<{
     if (raw) break;
   }
   return { node, raw };
+});
+
+/**
+ * POST /api/resume — launch `claude --resume <sessionId>` in a new terminal.
+ * Optional `fork: true` adds `--fork-session`. Validates session ID strictly to
+ * avoid command injection.
+ */
+fastify.post<{
+  Body: { sessionId?: unknown; cwd?: unknown; fork?: unknown };
+}>("/api/resume", async (req, reply) => {
+  const { sessionId, cwd, fork } = req.body ?? {};
+  if (typeof sessionId !== "string" || !SESSION_ID_RE.test(sessionId)) {
+    return reply.code(400).send({ error: "invalid sessionId" });
+  }
+  const safeCwd = typeof cwd === "string" && /^[A-Za-z]:[\\/].+/.test(cwd) ? cwd : null;
+  const args = ["--resume", sessionId];
+  if (fork) args.push("--fork-session");
+  // Build the user-facing command string for display + clipboard fallback
+  const cmd = `claude ${args.join(" ")}`;
+  try {
+    const { spawn } = await import("node:child_process");
+    if (process.platform === "win32") {
+      // Try wt.exe (Windows Terminal) first; fall back to cmd.exe /c start
+      const wtArgs: string[] = [];
+      if (safeCwd) wtArgs.push("-d", safeCwd);
+      wtArgs.push("cmd.exe", "/k", "claude", ...args);
+      try {
+        spawn("wt.exe", wtArgs, { detached: true, stdio: "ignore" }).unref();
+        return { ok: true, command: cmd, launched: "windows-terminal" };
+      } catch {
+        // fallback
+        const cwdArg = safeCwd ? `/d ${safeCwd}` : "";
+        spawn("cmd.exe", ["/c", "start", "cmd.exe", "/k", `${cwdArg} && claude ${args.join(" ")}`], {
+          detached: true,
+          stdio: "ignore",
+          shell: true,
+        }).unref();
+        return { ok: true, command: cmd, launched: "cmd" };
+      }
+    }
+    // POSIX (macOS / Linux): just print the command — terminal-launching is messy cross-DE
+    return { ok: false, command: cmd, hint: "Copy and run the command manually" };
+  } catch (err) {
+    return reply.code(500).send({ error: String(err), command: cmd });
+  }
 });
 
 fastify.post<{

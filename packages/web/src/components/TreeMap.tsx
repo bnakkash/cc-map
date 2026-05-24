@@ -47,6 +47,24 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     try { localStorage.setItem("cc-map-input-mode", inputMode); } catch {}
   }, [inputMode]);
+  // ───── Bookmarks (per-uuid) ─────
+  const [bookmarks, setBookmarks] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem("cc-map-bookmarks");
+      if (raw) return new Set(JSON.parse(raw) as string[]);
+    } catch {}
+    return new Set();
+  });
+  const toggleBookmark = useCallback((id: string) => {
+    setBookmarks((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      try { localStorage.setItem("cc-map-bookmarks", JSON.stringify([...next])); } catch {}
+      return next;
+    });
+  }, []);
+
   const [direction, setDirection] = useState<LayoutDirection>(() => {
     try {
       const raw = localStorage.getItem("cc-map-direction");
@@ -139,6 +157,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           isSidechain: Boolean(raw["isSidechain"]),
           timestamp: String(raw["timestamp"] ?? ""),
           preview: String(raw["preview"] ?? "").slice(0, 80),
+          outputTokens: typeof raw["outputTokens"] === "number" ? (raw["outputTokens"] as number) : 0,
           sessionsIn: 1,
         });
       }
@@ -624,6 +643,12 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         navigateBy(-1);
         return;
       }
+      // b: toggle bookmark on the selected node
+      if (e.key === "b" && selected) {
+        e.preventDefault();
+        toggleBookmark(selected);
+        return;
+      }
       // Spacebar: jump to live tip (the latest message in the live session)
       if (e.key === " " || e.code === "Space") {
         e.preventDefault();
@@ -688,7 +713,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [layout, size, forest, selected, helpOpen, searchOpen, onClose, effectiveActiveSession, liveTipId, mode, scopeProject]);
+  }, [layout, size, forest, selected, helpOpen, searchOpen, onClose, effectiveActiveSession, liveTipId, mode, scopeProject, toggleBookmark]);
 
   // ───── Tooltip data ─────
   const tooltipData = useMemo(() => {
@@ -812,6 +837,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           {effectiveActiveSession && (() => {
             const liveBand = layout?.sessionBands.find((b) => b.sessionId === effectiveActiveSession);
             const liveProj = forest.nodes.find((n) => n.sessionId === effectiveActiveSession)?.projectSlug ?? "";
+            const liveTitle = forest.sessionTitles?.[effectiveActiveSession]?.aiTitle;
             return (
               <button
                 className="flex flex-col items-start gap-1 w-full text-left p-2 -mx-1 rounded hover:bg-zinc-900 border border-emerald-900/40"
@@ -830,14 +856,61 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                   </span>
-                  <span className="text-emerald-400 font-mono text-[10px]">live · {effectiveActiveSession.slice(0, 8)}</span>
+                  <span className="text-emerald-400 font-mono text-[10px]">live</span>
                 </div>
-                <div className="text-zinc-400 text-[10px] truncate w-full" title={liveProj}>{prettySlug(liveProj)}</div>
-                {liveBand?.firstPrompt && (
-                  <div className="text-zinc-500 text-[10px] line-clamp-2 leading-tight w-full">{liveBand.firstPrompt}</div>
+                {liveTitle ? (
+                  <div className="text-zinc-200 text-xs leading-tight line-clamp-2 w-full">{liveTitle}</div>
+                ) : (
+                  <div className="text-zinc-300 text-xs font-mono">{effectiveActiveSession.slice(0, 8)}</div>
                 )}
+                <div className="text-zinc-500 text-[10px] truncate w-full" title={liveProj}>{prettySlug(liveProj)}</div>
               </button>
             );
+          })()}
+          {/* Bookmarks */}
+          {bookmarks.size > 0 && (
+            <div className="pt-2 border-t border-zinc-800">
+              <div className="text-zinc-500 text-xs mb-1">★ Bookmarks ({bookmarks.size})</div>
+              <div className="space-y-0.5 max-h-40 overflow-y-auto">
+                {[...bookmarks].map((bid) => {
+                  const n = forest.nodes.find((x) => x.id === bid);
+                  if (!n) return null;
+                  return (
+                    <button
+                      key={bid}
+                      className="w-full text-left px-1 py-0.5 rounded hover:bg-zinc-900 text-zinc-400 text-[10px] flex items-center gap-1"
+                      onClick={() => {
+                        setSelected(bid);
+                        const ln = layout?.nodes.get(bid);
+                        if (ln) {
+                          const t = transformRef.current;
+                          const sc = Math.max(t.scale, 1.5);
+                          animateTo({ scale: sc, tx: size.w / 2 - ln.x * sc, ty: size.h / 2 - ln.y * sc }, 250);
+                        }
+                      }}
+                      title={n.preview}
+                    >
+                      <span className="text-amber-400 shrink-0">★</span>
+                      <span className="truncate">{n.preview || bid.slice(0, 8)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          {/* Token totals across all projects */}
+          {(() => {
+            const total = forest.projects.reduce((acc, p) => ({
+              input: acc.input + (p.tokens?.input ?? 0),
+              output: acc.output + (p.tokens?.output ?? 0),
+              cacheRead: acc.cacheRead + (p.tokens?.cacheRead ?? 0),
+            }), { input: 0, output: 0, cacheRead: 0 });
+            const total_b = (total.input + total.output + total.cacheRead) / 1e6;
+            return total_b > 0 ? (
+              <div className="text-zinc-500" title={`${total.input.toLocaleString()} input + ${total.output.toLocaleString()} output + ${total.cacheRead.toLocaleString()} cache-read`}>
+                ≈{total_b.toFixed(1)}M tokens total
+              </div>
+            ) : null;
           })()}
           <div>{layout?.nodes.size.toLocaleString() ?? 0} visible · {forest.nodes.length.toLocaleString()} total</div>
           <div>{forest.sessionCount} sessions · {forest.forks.length} forks</div>
@@ -1009,6 +1082,24 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               void selectSessionInViewer(sessionId);
               onClose();
             }}
+            onResumeCLI={(sessionId, fork) => {
+              const token = localStorage.getItem("cc-map-token") ?? "";
+              fetch("/api/resume", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ sessionId, fork }),
+              })
+                .then((r) => r.json())
+                .then((r) => {
+                  if (!r.ok && r.command) {
+                    void navigator.clipboard.writeText(r.command);
+                    alert(`Manual launch needed.\nCommand copied to clipboard:\n  ${r.command}`);
+                  }
+                })
+                .catch((e) => alert(`Resume failed: ${e}`));
+            }}
+            isBookmarked={contextMenu.target.kind === "node" && contextMenu.target.id ? bookmarks.has(contextMenu.target.id) : false}
+            onToggleBookmark={(id) => toggleBookmark(id)}
             onClose={() => setContextMenu(null)}
           />
         </div>
@@ -1042,6 +1133,10 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               <KbdRow keys={["↑", "↓"]} desc="prev/next node in session" />
               <KbdRow keys={["←", "→"]} desc="prev/next node in session" />
               <KbdRow keys={["space"]} desc="jump to live tip (the message being written right now)" />
+              <KbdRow keys={["b"]} desc="bookmark the selected node" />
+            </KbdGroup>
+            <KbdGroup title="CLI integration (right-click any node)">
+              <KbdRow keys={["right-click"]} desc="resume / fork / copy command for that session" />
             </KbdGroup>
             <KbdGroup title="Search & navigation">
               <KbdRow keys={["/"]} desc="search messages" />
@@ -1299,6 +1394,9 @@ function ContextMenuItems({
   onZoomOut,
   onSelect,
   onOpenInViewer,
+  onResumeCLI,
+  isBookmarked,
+  onToggleBookmark,
   onClose,
 }: {
   target: { kind: "node" | "session" | "empty"; id?: string };
@@ -1310,6 +1408,9 @@ function ContextMenuItems({
   onZoomOut: () => void;
   onSelect: (id: string) => void;
   onOpenInViewer: (sessionId: string) => void;
+  onResumeCLI: (sessionId: string, fork: boolean) => void;
+  isBookmarked: boolean;
+  onToggleBookmark: (id: string) => void;
   onClose: () => void;
 }) {
   const node = target.kind === "node" && target.id ? forest.nodes.find((n) => n.id === target.id) : null;
@@ -1358,13 +1459,32 @@ function ContextMenuItems({
           }}
         />
       )}
+      {target.kind === "node" && target.id && (
+        <MenuItem
+          label={isBookmarked ? "★ Remove bookmark" : "☆ Bookmark this message"}
+          onClick={() => { onToggleBookmark(target.id!); onClose(); }}
+        />
+      )}
       {sessionId && (
         <>
+          <MenuDivider />
+          <MenuItem
+            label="Resume session in new terminal"
+            onClick={() => { onResumeCLI(sessionId, false); onClose(); }}
+          />
+          <MenuItem
+            label="Fork session (--fork-session)"
+            onClick={() => { onResumeCLI(sessionId, true); onClose(); }}
+          />
+          <MenuItem
+            label="Copy resume command"
+            onClick={() => copy(`claude --resume ${sessionId}`)}
+          />
+          <MenuDivider />
           <MenuItem
             label="Open in viewer"
             onClick={() => onOpenInViewer(sessionId)}
           />
-          <MenuDivider />
           <MenuItem
             label="Copy session ID"
             onClick={() => copy(sessionId)}
