@@ -1,33 +1,57 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
-import "highlight.js/styles/github-dark.css";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+// Markdown rendering (react-markdown + rehype-highlight + highlight.js) is
+// ~200KB of the initial bundle. Lazy-load so the first paint is the canvas,
+// not a Markdown lexer. Loads when the user first opens a node's detail.
+const ContentRender = lazy(() => import("./ContentRender.js"));
 import { api, type NodeResponse } from "../api.js";
 import { useSse, type SseEvent } from "../sse.js";
 import { useStore } from "../store.js";
-import { buildLayout } from "../canvas/layout.js";
+import { buildLayout, timelineNowY } from "../canvas/layout.js";
 import {
   MAX_SCALE,
   MIN_SCALE,
   type Transform,
   fitToBounds,
   fitTransform,
+  getOffscreenLiveArrowBox,
+  getSubagentBadgeAt,
   hitTest,
   lodOf,
   render,
 } from "../canvas/renderer.js";
-import { projectColor } from "../canvas/colors.js";
-import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type NodeStyle, type SessionFilter, type Space, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
+import { buildColorContext, projectColor } from "../canvas/colors.js";
+import { Minimap } from "./Minimap.js";
+import { BookmarkGutter } from "./BookmarkGutter.js";
+import { CommandPalette, type PaletteItem } from "./CommandPalette.js";
+import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type ColorMode, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type NodeStyle, type SessionFilter, type Space, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
 
 const PAN_THRESHOLD_PX = 5;
 
 export function TreeMap({ onClose }: { onClose: () => void }) {
   const [forest, setForest] = useState<ForestPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [mode, setMode] = useState<ViewMode>("per-project");
-  const [scopeProject, setScopeProject] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  // URL state takes priority over localStorage so deep-links land you on the
+  // exact view someone shared. After mount, any state change is mirrored back
+  // to the URL hash via replaceState (no history spam).
+  const urlInit = useMemo(() => parseUrlState(), []);
+  const [mode, setMode] = useState<ViewMode>(urlInit.mode ?? "per-project");
+  const [scopeProject, setScopeProject] = useState<string | null>(urlInit.scopeProject ?? null);
+  const [selected, setSelected] = useState<string | null>(urlInit.selected ?? null);
+  // Multi-select set: ctrl/cmd+click toggles a node in/out. Used for bulk
+  // bookmark and bulk add-to-Space actions. Separate from `selected` (single).
+  const [multiSelected, setMultiSelected] = useState<Set<string>>(new Set());
+  // Pinned inline card (cards mode only). When set, the inline expand stays
+  // open on that card even as you click around. Snapshots the detail at pin
+  // time so subsequent selections don't overwrite its content.
+  const [pinnedCardId, setPinnedCardId] = useState<string | null>(null);
+  const [pinnedDetail, setPinnedDetail] = useState<NodeResponse | null>(null);
+  // Browser-style selection history. User picks (click, search step, keyboard
+  // nav, etc.) push entries; alt+left/right walk back and forward through them.
+  const selectionHistoryRef = useRef<{ entries: string[]; cursor: number }>({ entries: [], cursor: -1 });
+  // True for one tick when we're driving setSelected from a history nav, so
+  // the push effect doesn't immediately push the same id back.
+  const navigatingHistoryRef = useRef(false);
   const [selectedDetail, setSelectedDetail] = useState<NodeResponse | null>(null);
   const [hovered, setHovered] = useState<{ kind: "node" | "session"; id: string } | null>(null);
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
@@ -38,7 +62,50 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   const selectSessionInViewer = useStore((s) => s.selectSession);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  // Recent searches (last 10) — shown as suggestions when search opens empty.
+  const [recentSearches, setRecentSearches] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("cc-map-recent-searches");
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) return arr.filter((s) => typeof s === "string").slice(0, 10);
+      }
+    } catch {}
+    return [];
+  });
+  const pushRecentSearch = useCallback((q: string) => {
+    const t = q.trim();
+    if (!t) return;
+    setRecentSearches((prev) => {
+      const next = [t, ...prev.filter((x) => x !== t)].slice(0, 10);
+      try { localStorage.setItem("cc-map-recent-searches", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
+  const removeRecentSearch = useCallback((q: string) => {
+    setRecentSearches((prev) => {
+      const next = prev.filter((x) => x !== q);
+      try { localStorage.setItem("cc-map-recent-searches", JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  // Sidebar collapse-all / expand-all. We re-key the sidebar so every
+  // SidebarGroup re-mounts and reads its (just-updated) localStorage flag.
+  // Cheaper than threading a forceOpen prop into every group.
+  const SIDEBAR_GROUP_IDS = ["scope", "display", "live", "filter", "live-card", "saved", "activity"];
+  const [sidebarKey, setSidebarKey] = useState(0);
+  const setAllGroupsOpen = useCallback((open: boolean) => {
+    for (const gid of SIDEBAR_GROUP_IDS) {
+      try { localStorage.setItem(`cc-map-sb-${gid}`, open ? "1" : "0"); } catch {}
+    }
+    setSidebarKey((k) => k + 1);
+  }, []);
+  // Welcome modal shown on first visit (no localStorage flag yet).
+  const [welcomeOpen, setWelcomeOpen] = useState(() => {
+    try { return localStorage.getItem("cc-map-seen-welcome") !== "1"; } catch { return false; }
+  });
   const [inputMode, setInputMode] = useState<"auto" | "mouse" | "trackpad">(() => {
     try {
       const raw = localStorage.getItem("cc-map-input-mode");
@@ -49,6 +116,14 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     try { localStorage.setItem("cc-map-input-mode", inputMode); } catch {}
   }, [inputMode]);
+  // Spawn modal state — defined here so context menu handlers below can open it.
+  // The submit handler is wired further down after addSessionToSpace is defined.
+  const [spawnModal, setSpawnModal] = useState<
+    | null
+    | { mode: "new"; cwd: string; prompt: string; targetSpaceId: string | null }
+    | { mode: "continue"; sessionId: string; cwd: string; prompt: string }
+  >(null);
+
   // ───── Spaces (top-level workspaces) ─────
   // A Space is a curated subset of the forest. Switching INTO a space filters
   // the map to its member sessions. Spaces are persisted to localStorage.
@@ -61,6 +136,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     return [];
   });
   const [activeSpaceId, setActiveSpaceId] = useState<string | null>(() => {
+    if (urlInit.activeSpaceId !== undefined) return urlInit.activeSpaceId;
     try {
       return localStorage.getItem("cc-map-active-space") || null;
     } catch { return null; }
@@ -93,6 +169,42 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     setActiveSpaceId((cur) => (cur === id ? null : cur));
   }, []);
   const activeSpace = activeSpaceId ? spaces.find((s) => s.id === activeSpaceId) ?? null : null;
+
+  // Drag-to-Space state. Shift+drag a node on canvas → drags its session as a
+  // chip. Hovering a Space chip in the sidebar highlights it; release drops
+  // the session into that space.
+  const [dragSession, setDragSession] = useState<{ sessionId: string; label: string; x: number; y: number } | null>(null);
+  const [dragOverSpaceId, setDragOverSpaceId] = useState<string | null>(null);
+  // Global drag tracker: while dragSession is active, follow the cursor and
+  // detect which space chip is under it. On release, drop into that space.
+  useEffect(() => {
+    if (!dragSession) return;
+    const onMove = (e: MouseEvent) => {
+      setDragSession((d) => (d ? { ...d, x: e.clientX, y: e.clientY } : d));
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const chip = el?.closest("[data-space-id]") as HTMLElement | null;
+      setDragOverSpaceId(chip ? chip.dataset.spaceId ?? null : null);
+    };
+    const onUp = (e: MouseEvent) => {
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const chip = el?.closest("[data-space-id]") as HTMLElement | null;
+      const targetId = chip?.dataset.spaceId ?? null;
+      if (targetId) {
+        const sp = spaces.find((s) => s.id === targetId);
+        if (sp && !sp.sessionIds.includes(dragSession.sessionId)) {
+          upsertSpace({ ...sp, sessionIds: [...sp.sessionIds, dragSession.sessionId] });
+        }
+      }
+      setDragSession(null);
+      setDragOverSpaceId(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [dragSession, spaces, upsertSpace]);
   // Add/remove a session from the active space
   const addSessionToSpace = useCallback((sid: string, targetSpaceId?: string) => {
     const id = targetSpaceId ?? activeSpaceId;
@@ -110,6 +222,52 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     upsertSpace({ ...sp, sessionIds: sp.sessionIds.filter((x) => x !== sid) });
   }, [spaces, activeSpaceId, upsertSpace]);
   void persistSpaces; // exposed for future bulk ops
+
+  // Submit the spawn modal — POST to server, then auto-add the new sessionId
+  // to the target space (if "new" mode) so it shows up in the space's filter.
+  // After "new" submit: auto-transitions into "continue" mode for that session,
+  // so the same modal stays open as a chat-like back-and-forth.
+  // After "continue" submit: clears the prompt, keeps modal open for next turn.
+  const submitSpawn = useCallback(async () => {
+    if (!spawnModal) return;
+    if (!spawnModal.prompt.trim()) return;
+    const token = localStorage.getItem("cc-map-token") ?? "";
+    const path = spawnModal.mode === "new" ? "/api/spawn-session" : "/api/continue-session";
+    const body = spawnModal.mode === "new"
+      ? { prompt: spawnModal.prompt, cwd: spawnModal.cwd }
+      : { sessionId: spawnModal.sessionId, prompt: spawnModal.prompt, cwd: spawnModal.cwd };
+    try {
+      const r = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
+      });
+      const j = (await r.json()) as { ok?: boolean; sessionId?: string; error?: string };
+      if (!r.ok || !j.ok) {
+        alert(`Spawn failed: ${j.error ?? r.statusText}`);
+        return;
+      }
+      // For "new" mode: add session to space + transition modal to "continue" mode
+      if (spawnModal.mode === "new") {
+        if (spawnModal.targetSpaceId && j.sessionId) {
+          addSessionToSpace(j.sessionId, spawnModal.targetSpaceId);
+        }
+        if (j.sessionId) {
+          setSpawnModal({
+            mode: "continue",
+            sessionId: j.sessionId,
+            cwd: spawnModal.cwd,
+            prompt: "",
+          });
+        }
+      } else {
+        // continue mode: keep modal open, clear prompt for next turn
+        setSpawnModal({ ...spawnModal, prompt: "" });
+      }
+    } catch (e) {
+      alert(`Spawn failed: ${e}`);
+    }
+  }, [spawnModal, addSessionToSpace]);
 
   // ───── Bookmarks (per-uuid) ─────
   const [bookmarks, setBookmarks] = useState<Set<string>>(() => {
@@ -130,6 +288,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   }, []);
 
   const [nodeStyle, setNodeStyle] = useState<NodeStyle>(() => {
+    if (urlInit.nodeStyle) return urlInit.nodeStyle;
     try {
       const raw = localStorage.getItem("cc-map-nodestyle");
       if (raw === "cards" || raw === "dots") return raw;
@@ -141,9 +300,10 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   }, [nodeStyle]);
 
   const [direction, setDirection] = useState<LayoutDirection>(() => {
+    if (urlInit.direction) return urlInit.direction;
     try {
       const raw = localStorage.getItem("cc-map-direction");
-      if (raw === "grid" || raw === "column") return raw;
+      if (raw === "grid" || raw === "column" || raw === "timeline") return raw;
     } catch {}
     return "grid";
   });
@@ -185,8 +345,78 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     });
   }, []);
 
+  // Saved views: a named snapshot of (mode, scopeProject, filter, visibility,
+  // nodeStyle, direction, colorMode). Stored in localStorage. Persists across
+  // sessions so power users can hop between curated views.
+  interface SavedView {
+    id: string;
+    name: string;
+    mode: ViewMode;
+    scopeProject: string | null;
+    filter: SessionFilter;
+    visibility: VisibilityFilter;
+    nodeStyle: NodeStyle;
+    direction: LayoutDirection;
+    colorMode: ColorMode;
+  }
+  const [savedViews, setSavedViews] = useState<SavedView[]>(() => {
+    try {
+      const raw = localStorage.getItem("cc-map-views");
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) return arr;
+      }
+    } catch {}
+    return [];
+  });
+  const persistViews = useCallback((next: SavedView[]) => {
+    setSavedViews(next);
+    try { localStorage.setItem("cc-map-views", JSON.stringify(next)); } catch {}
+  }, []);
+
+  const [colorMode, setColorMode] = useState<ColorMode>(() => {
+    if (urlInit.colorMode) return urlInit.colorMode;
+    try {
+      const raw = localStorage.getItem("cc-map-color-mode");
+      if (raw === "role" || raw === "recency" || raw === "cost") return raw;
+    } catch {}
+    return "role";
+  });
+  useEffect(() => {
+    try { localStorage.setItem("cc-map-color-mode", colorMode); } catch {}
+  }, [colorMode]);
+
+  // Mirror current view state to the URL hash so it's shareable + bookmarkable.
+  // Uses replaceState so we don't pile up history entries on every toggle.
+  useEffect(() => {
+    writeUrlState({ mode, scopeProject, direction, nodeStyle, colorMode, activeSpaceId, selected });
+  }, [mode, scopeProject, direction, nodeStyle, colorMode, activeSpaceId, selected]);
+
+  // Follow Live: when on, auto-pan to keep the live tip centered as new
+  // messages land. Persists per-device. Auto-disengages on manual pan/zoom
+  // so the user doesn't fight the camera.
+  const [followLive, setFollowLive] = useState<boolean>(() => {
+    try { return localStorage.getItem("cc-map-follow-live") === "1"; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("cc-map-follow-live", followLive ? "1" : "0"); } catch {}
+  }, [followLive]);
+
   const transformRef = useRef<Transform>({ tx: 0, ty: 0, scale: 1 });
   const dirtyRef = useRef(true);
+  // Morph state: when the layout changes shape (direction or nodeStyle), we
+  // smoothly interpolate node and band positions from prev → new over ~450ms
+  // so the spatial transition is readable instead of a jarring snap.
+  const prevLayoutRef = useRef<Layout | null>(null);
+  const lastShapeRef = useRef<{ direction: LayoutDirection; nodeStyle: NodeStyle } | null>(null);
+  const morphRef = useRef<{
+    startMs: number;
+    durationMs: number;
+    oldNodes: Map<string, { x: number; y: number; cardHeight?: number }>;
+    targetNodes: Map<string, { x: number; y: number; cardHeight?: number }>;
+    oldBands: Map<string, { minX: number; maxX: number; minY: number; maxY: number }>;
+    targetBands: Map<string, { minX: number; maxX: number; minY: number; maxY: number }>;
+  } | null>(null);
   // Animated transitions: when set, RAF interpolates from `from` to `to`.
   const transitionRef = useRef<{ from: Transform; to: Transform; startMs: number; durationMs: number } | null>(null);
 
@@ -227,6 +457,23 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   // we replace the `forest` reference. Throttled to coalesce rapid bursts.
   const pendingNodesRef = useRef<ForestNode[]>([]);
   const flushTimerRef = useRef<number | null>(null);
+  // Recent activity toasts — popups in the bottom-right for new messages
+  // arriving in OTHER sessions (not the one you're currently watching).
+  // Auto-prune after TOAST_TTL_MS so they don't pile up.
+  interface ActivityToast {
+    nodeId: string;
+    sessionId: string;
+    projectSlug: string;
+    role: "user" | "assistant";
+    subtype: string | null;
+    preview: string;
+    receivedMs: number;
+  }
+  const [activityToasts, setActivityToasts] = useState<ActivityToast[]>([]);
+  const TOAST_TTL_MS = 6000;
+  // Keep a ref to the currently-watched session id so the SSE callback (which
+  // is stable across renders) can read it without re-binding.
+  const activeWatchedRef = useRef<string | null>(null);
   const onSse = useCallback((e: SseEvent) => {
     if (e.type === "delta") {
       // eslint-disable-next-line no-console
@@ -264,6 +511,36 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             for (const n of toAdd) existing.set(n.id, n);
             return { ...prev, nodes: [...existing.values()] };
           });
+          // Build toasts for "interesting" new nodes in OTHER sessions.
+          // Skip noise: tool-only assistant turns, tool-results, system messages.
+          const watched = activeWatchedRef.current;
+          const isInteresting = (n: ForestNode) => {
+            if (n.role === "assistant") return n.subtype === "text";
+            return n.subtype === "prompt";
+          };
+          const newToasts: ActivityToast[] = [];
+          const seenSessions = new Set<string>();
+          // Iterate newest first; only one toast per session per flush
+          for (let i = toAdd.length - 1; i >= 0; i--) {
+            const n = toAdd[i]!;
+            if (!isInteresting(n)) continue;
+            if (n.sessionId === watched) continue;
+            if (seenSessions.has(n.sessionId)) continue;
+            seenSessions.add(n.sessionId);
+            newToasts.push({
+              nodeId: n.id,
+              sessionId: n.sessionId,
+              projectSlug: n.projectSlug,
+              role: n.role,
+              subtype: n.subtype,
+              preview: n.preview,
+              receivedMs: Date.now(),
+            });
+            if (newToasts.length >= 3) break;
+          }
+          if (newToasts.length > 0) {
+            setActivityToasts((prev) => [...newToasts, ...prev].slice(0, 5));
+          }
         }, 250);
       }
     } else if (e.type === "active-session") {
@@ -271,6 +548,16 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     }
   }, []);
   useSse(onSse, fetchForest);
+
+  // Prune activity toasts that have aged out (TOAST_TTL_MS).
+  useEffect(() => {
+    if (activityToasts.length === 0) return;
+    const id = window.setInterval(() => {
+      const now = Date.now();
+      setActivityToasts((prev) => prev.filter((t) => now - t.receivedMs < TOAST_TTL_MS));
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [activityToasts.length]);
 
   // ───── Allowed sessions from facet filter + active space ─────
   // null means "no filter active" — buildLayout treats this as everything allowed.
@@ -315,6 +602,39 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     return l;
   }, [forest, mode, scopeProject, visibility, direction, allowedSessions, nodeStyle]);
 
+  // Morph trigger: capture old positions from prevLayoutRef → animate them
+  // toward the just-computed layout's positions. Fires on direction/nodeStyle
+  // shape changes only (filter changes shouldn't morph — they add/remove nodes
+  // and morph there looks weird).
+  useEffect(() => {
+    if (!layout) return;
+    const lastShape = lastShapeRef.current;
+    const shapeChanged = lastShape && (lastShape.direction !== direction || lastShape.nodeStyle !== nodeStyle);
+    const prevLayout = prevLayoutRef.current;
+    if (shapeChanged && prevLayout && prevLayout.nodes.size > 0 && layout.nodes.size > 0) {
+      const oldNodes = new Map<string, { x: number; y: number; cardHeight?: number }>();
+      const targetNodes = new Map<string, { x: number; y: number; cardHeight?: number }>();
+      for (const [id, ln] of prevLayout.nodes) {
+        const entry: { x: number; y: number; cardHeight?: number } = { x: ln.x, y: ln.y };
+        if (ln.cardHeight !== undefined) entry.cardHeight = ln.cardHeight;
+        oldNodes.set(id, entry);
+      }
+      for (const [id, ln] of layout.nodes) {
+        const entry: { x: number; y: number; cardHeight?: number } = { x: ln.x, y: ln.y };
+        if (ln.cardHeight !== undefined) entry.cardHeight = ln.cardHeight;
+        targetNodes.set(id, entry);
+      }
+      const oldBands = new Map<string, { minX: number; maxX: number; minY: number; maxY: number }>();
+      const targetBands = new Map<string, { minX: number; maxX: number; minY: number; maxY: number }>();
+      for (const b of prevLayout.sessionBands) oldBands.set(b.sessionId, { minX: b.minX, maxX: b.maxX, minY: b.minY, maxY: b.maxY });
+      for (const b of layout.sessionBands) targetBands.set(b.sessionId, { minX: b.minX, maxX: b.maxX, minY: b.minY, maxY: b.maxY });
+      morphRef.current = { startMs: performance.now(), durationMs: 450, oldNodes, targetNodes, oldBands, targetBands };
+      dirtyRef.current = true;
+    }
+    prevLayoutRef.current = layout;
+    lastShapeRef.current = { direction, nodeStyle };
+  }, [layout, direction, nodeStyle]);
+
   // Union of tools across all sessions in the current scope — what we offer in the filter UI
   const availableTools = useMemo(() => {
     if (!forest?.sessionTitles) return [] as string[];
@@ -335,6 +655,21 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     }
     return ids;
   }, [searchQuery, forest]);
+  // Ordered list of matches (by timestamp) so n/N can step through them in a
+  // predictable order. Filtered to ids that actually exist in the current
+  // layout (visibility filters might hide some matches).
+  const matchList = useMemo(() => {
+    if (!matches || !forest || !layout) return [] as string[];
+    const arr: { id: string; ts: string }[] = [];
+    for (const n of forest.nodes) {
+      if (matches.has(n.id) && layout.nodes.has(n.id)) arr.push({ id: n.id, ts: n.timestamp });
+    }
+    arr.sort((a, b) => a.ts.localeCompare(b.ts));
+    return arr.map((x) => x.id);
+  }, [matches, forest, layout]);
+  // Cursor into matchList: which match is currently focused (panned to).
+  const [matchIndex, setMatchIndex] = useState(0);
+  useEffect(() => { setMatchIndex(0); }, [searchQuery]);
 
   // ───── Canvas sizing ─────
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -382,6 +717,15 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     return latestSessionId;
   }, [forest]);
 
+  // Keep the toast-filter watched-session ref in sync with what the user is
+  // focused on (selection > active session). Toasts skip the watched session
+  // since the user's already looking at it.
+  useEffect(() => {
+    activeWatchedRef.current = selected
+      ? forest?.nodes.find((n) => n.id === selected)?.sessionId ?? null
+      : effectiveActiveSession ?? null;
+  }, [selected, forest, effectiveActiveSession]);
+
   // Live tip = latest "meaningful" node in the active session: only prompts or
   // assistant turns, not tool-results / slash / system-reminders. If only noise
   // is visible, fall back to any visible node so you still see something.
@@ -403,6 +747,175 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     }
     return bestId ?? fallbackId;
   }, [layout, forest, effectiveActiveSession]);
+
+  // ───── Command palette items ─────
+  // Built fresh each render so labels reflect current state. Categories are
+  // grouped and rendered in order; keep "Jump to session" first so the
+  // most-common use (find a session by content) is at top of the empty query.
+  const paletteItems = useMemo<PaletteItem[]>(() => {
+    if (!forest || !layout) return [];
+    const items: PaletteItem[] = [];
+
+    // Jump to session — first prompt as a friendly title
+    const sessionsSeen = new Set<string>();
+    for (const band of layout.sessionBands) {
+      if (sessionsSeen.has(band.sessionId)) continue;
+      sessionsSeen.add(band.sessionId);
+      const title = forest.sessionTitles?.[band.sessionId]?.aiTitle
+        || band.firstPrompt
+        || "(untitled)";
+      items.push({
+        id: `jump-session-${band.sessionId}`,
+        category: "Jump to session",
+        label: title.slice(0, 80),
+        hint: `${band.sessionId.slice(0, 8)} · ${band.nodeCount} nodes`,
+        action: () => { animateTo(fitToBounds(band, size.w, size.h, 80)); },
+      });
+    }
+
+    // Bookmarks
+    for (const bid of bookmarks) {
+      const n = forest.nodes.find((x) => x.id === bid);
+      if (!n) continue;
+      items.push({
+        id: `jump-bookmark-${bid}`,
+        category: "Bookmarks",
+        label: `★ ${n.preview.slice(0, 80) || bid.slice(0, 8)}`,
+        hint: bid.slice(0, 8),
+        action: () => {
+          setSelected(bid);
+          const ln = layout.nodes.get(bid);
+          if (ln) {
+            const t = transformRef.current;
+            animateTo({ scale: t.scale, tx: size.w / 2 - ln.x * t.scale, ty: size.h / 2 - ln.y * t.scale }, 350);
+          }
+        },
+      });
+    }
+
+    // Spaces
+    items.push({
+      id: "space-all",
+      category: "Switch space",
+      label: "All sessions",
+      hint: `${forest.sessionCount} total`,
+      action: () => setActiveSpaceId(null),
+    });
+    for (const sp of spaces) {
+      items.push({
+        id: `space-${sp.id}`,
+        category: "Switch space",
+        label: `✦ ${sp.name}`,
+        hint: `${sp.sessionIds.length} sessions`,
+        action: () => setActiveSpaceId(sp.id),
+      });
+    }
+
+    // Saved views
+    for (const v of savedViews) {
+      items.push({
+        id: `view-${v.id}`,
+        category: "Apply saved view",
+        label: v.name,
+        hint: `${v.direction} · ${v.nodeStyle} · ${v.colorMode}`,
+        action: () => {
+          setMode(v.mode);
+          setScopeProject(v.scopeProject);
+          setFilter(v.filter);
+          setVisibility(v.visibility);
+          setNodeStyle(v.nodeStyle);
+          setDirection(v.direction);
+          setColorMode(v.colorMode);
+        },
+      });
+    }
+
+    // Mode toggles
+    for (const d of ["grid", "column", "timeline"] as const) {
+      items.push({
+        id: `dir-${d}`,
+        category: "Switch layout",
+        label: `Layout: ${d}${direction === d ? " (current)" : ""}`,
+        action: () => setDirection(d),
+      });
+    }
+    for (const s of ["dots", "cards"] as const) {
+      items.push({
+        id: `style-${s}`,
+        category: "Switch nodes",
+        label: `Nodes: ${s}${nodeStyle === s ? " (current)" : ""}`,
+        action: () => setNodeStyle(s),
+      });
+    }
+    for (const c of ["role", "recency", "cost"] as const) {
+      items.push({
+        id: `color-${c}`,
+        category: "Switch color",
+        label: `Color: ${c}${colorMode === c ? " (current)" : ""}`,
+        action: () => setColorMode(c),
+      });
+    }
+    for (const m of ["per-project", "all-projects"] as const) {
+      items.push({
+        id: `mode-${m}`,
+        category: "Switch view",
+        label: `View: ${m}${mode === m ? " (current)" : ""}`,
+        action: () => setMode(m),
+      });
+    }
+
+    // Project scope quick switch
+    for (const p of forest.projects) {
+      items.push({
+        id: `scope-${p.slug}`,
+        category: "Scope to project",
+        label: prettySlug(p.slug),
+        hint: `${p.sessionCount} sessions`,
+        action: () => { setMode("per-project"); setScopeProject(p.slug); },
+      });
+    }
+
+    // Actions
+    items.push({
+      id: "fit-all",
+      category: "Actions",
+      label: "Fit all to viewport",
+      kbd: "f / 0",
+      action: () => { if (layout) animateTo(fitTransform(layout, size.w, size.h)); },
+    });
+    if (liveTipId) {
+      items.push({
+        id: "jump-live",
+        category: "Actions",
+        label: "Jump to live tip",
+        kbd: "space",
+        action: () => {
+          const ln = layout.nodes.get(liveTipId);
+          if (ln) {
+            const t = transformRef.current;
+            const sc = Math.max(t.scale, 1.5);
+            animateTo({ scale: sc, tx: size.w / 2 - ln.x * sc, ty: size.h / 2 - ln.y * sc }, 250);
+            setSelected(liveTipId);
+          }
+        },
+      });
+    }
+    items.push({
+      id: "toggle-follow-live",
+      category: "Actions",
+      label: followLive ? "Turn off follow-live" : "Turn on follow-live",
+      action: () => setFollowLive((v) => !v),
+    });
+    items.push({
+      id: "open-search",
+      category: "Actions",
+      label: "Search messages…",
+      kbd: "/",
+      action: () => setSearchOpen(true),
+    });
+
+    return items;
+  }, [forest, layout, bookmarks, spaces, savedViews, direction, nodeStyle, colorMode, mode, liveTipId, followLive, size.w, size.h]);
 
   // ───── Initial fit + re-fit when direction changes ─────
   // Prefer the ACTIVE session (the one you're typing in right now) so the live
@@ -453,7 +966,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           setSize({ w: cw, h: ch });
         }
       }
-      // Animation
+      // Animation: camera transform
       const tr = transitionRef.current;
       if (tr) {
         const elapsed = performance.now() - tr.startMs;
@@ -467,8 +980,42 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         dirtyRef.current = true;
         if (t >= 1) transitionRef.current = null;
       }
-      // Continuously dirty when there's anything animated (live pulse, transition)
-      if (transitionRef.current || liveTipId || effectiveActiveSession) {
+      // Animation: node/band position morph (direction or nodeStyle change)
+      const m = morphRef.current;
+      if (m && layout) {
+        const t = Math.min(1, (performance.now() - m.startMs) / m.durationMs);
+        const e = easeOutCubic(t);
+        for (const [id, ln] of layout.nodes) {
+          const target = m.targetNodes.get(id);
+          if (!target) continue;
+          const old = m.oldNodes.get(id);
+          if (old) {
+            ln.x = old.x + (target.x - old.x) * e;
+            ln.y = old.y + (target.y - old.y) * e;
+            if (target.cardHeight !== undefined && old.cardHeight !== undefined) {
+              ln.cardHeight = old.cardHeight + (target.cardHeight - old.cardHeight) * e;
+            }
+          } else {
+            ln.x = target.x; ln.y = target.y;
+            if (target.cardHeight !== undefined) ln.cardHeight = target.cardHeight;
+          }
+        }
+        for (const band of layout.sessionBands) {
+          const target = m.targetBands.get(band.sessionId);
+          if (!target) continue;
+          const old = m.oldBands.get(band.sessionId);
+          if (old) {
+            band.minX = old.minX + (target.minX - old.minX) * e;
+            band.maxX = old.maxX + (target.maxX - old.maxX) * e;
+            band.minY = old.minY + (target.minY - old.minY) * e;
+            band.maxY = old.maxY + (target.maxY - old.maxY) * e;
+          }
+        }
+        dirtyRef.current = true;
+        if (t >= 1) morphRef.current = null;
+      }
+      // Continuously dirty when there's anything animated (live pulse, transition, morph)
+      if (transitionRef.current || morphRef.current || liveTipId || effectiveActiveSession) {
         dirtyRef.current = true;
       }
       if (dirtyRef.current && cw > 0 && ch > 0) {
@@ -487,6 +1034,9 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             liveTipId,
             nowMs: performance.now(),
             nodeStyle,
+            colorMode,
+            subagentsCollapsed: !visibility.subagent,
+            multiSelectedIds: multiSelected.size > 0 ? multiSelected : null,
           },
           cw,
           ch,
@@ -496,13 +1046,69 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [layout, size, selected, hovered, mode, matches, forest, liveTipId, effectiveActiveSession, nodeStyle]);
+  }, [layout, size, selected, hovered, mode, matches, forest, liveTipId, effectiveActiveSession, nodeStyle, colorMode, visibility.subagent, multiSelected]);
 
   // ───── Mouse interactions ─────
   const dragRef = useRef<{ startX: number; startY: number; startTx: number; startTy: number; moved: boolean } | null>(null);
 
   const onMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
+    // Shift+click on a node/session band starts a drag-to-Space gesture.
+    if (e.shiftKey && layout) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      const hit = hitTest(layout, transformRef.current, sx, sy, nodeStyle);
+      if (hit) {
+        const sid = hit.kind === "node"
+          ? layout.nodes.get(hit.id)?.sessionId
+          : hit.id;
+        if (sid) {
+          const band = layout.sessionBands.find((b) => b.sessionId === sid);
+          const label = band?.firstPrompt?.slice(0, 60) || sid.slice(0, 8);
+          setDragSession({ sessionId: sid, label, x: e.clientX, y: e.clientY });
+          return;
+        }
+      }
+    }
+    if (layout) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      // Subagent "+N" badge → expand subagents globally
+      const badgeParent = getSubagentBadgeAt(
+        layout,
+        transformRef.current,
+        !visibility.subagent,
+        nodeStyle,
+        sx,
+        sy,
+      );
+      if (badgeParent) {
+        toggleVisibility("subagent");
+        return;
+      }
+    }
+    // Off-screen live arrow takes priority over pan when the user clicks on it.
+    if (layout && liveTipId) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      const box = getOffscreenLiveArrowBox(layout, transformRef.current, liveTipId, size.w, size.h);
+      if (box && sx >= box.x && sx <= box.x + box.w && sy >= box.y && sy <= box.y + box.h) {
+        const tip = layout.nodes.get(liveTipId);
+        if (tip) {
+          const t = transformRef.current;
+          transitionRef.current = {
+            from: { ...t },
+            to: { scale: t.scale, tx: size.w / 2 - tip.x * t.scale, ty: size.h / 2 - tip.y * t.scale },
+            startMs: performance.now(),
+            durationMs: 400,
+          };
+        }
+        return;
+      }
+    }
     transitionRef.current = null;
     dragRef.current = {
       startX: e.clientX,
@@ -511,7 +1117,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       startTy: transformRef.current.ty,
       moved: false,
     };
-  }, []);
+  }, [layout, liveTipId, size.w, size.h, visibility.subagent, nodeStyle, toggleVisibility]);
 
   const onMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const drag = dragRef.current;
@@ -551,14 +1157,24 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     const hit = hitTest(layout, transformRef.current, e.clientX - rect.left, e.clientY - rect.top, nodeStyle);
     if (!hit) return;
     if (hit.kind === "node") {
-      setSelected(hit.id);
+      // Ctrl/Cmd+click → toggle in multi-select set (doesn't disturb `selected`)
+      if (e.ctrlKey || e.metaKey) {
+        setMultiSelected((prev) => {
+          const next = new Set(prev);
+          if (next.has(hit.id)) next.delete(hit.id);
+          else next.add(hit.id);
+          return next;
+        });
+      } else {
+        setSelected(hit.id);
+      }
     } else {
       // session band click → zoom to that session
       const band = layout.sessionBands.find((b) => b.sessionId === hit.id);
       if (band) animateTo(fitToBounds(band, size.w, size.h, 80));
     }
     dirtyRef.current = true;
-  }, [layout, size]);
+  }, [layout, size, nodeStyle]);
 
   const onDoubleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     // Google-Maps-style: double-click zooms in 2× at the cursor.
@@ -607,6 +1223,48 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       durationMs,
     };
   }
+
+  // Pan (preserving scale) to put a layout-coord point at the viewport center.
+  const panToLayoutPoint = useCallback((lx: number, ly: number, durationMs = 350) => {
+    const t = transformRef.current;
+    animateTo(
+      { scale: t.scale, tx: size.w / 2 - lx * t.scale, ty: size.h / 2 - ly * t.scale },
+      durationMs,
+    );
+  }, [size.w, size.h]);
+
+  // Step the search cursor by ±1 (with wrap-around) and pan to that match.
+  // Successfully stepping a query also commits it to recent-searches so the
+  // next time you open search empty, you can re-run prior queries with a click.
+  const stepMatch = useCallback((dir: 1 | -1) => {
+    if (matchList.length === 0 || !layout) return;
+    pushRecentSearch(searchQuery);
+    const next = ((matchIndex + dir) % matchList.length + matchList.length) % matchList.length;
+    setMatchIndex(next);
+    const id = matchList[next]!;
+    const ln = layout.nodes.get(id);
+    if (ln) {
+      setSelected(id);
+      const t = transformRef.current;
+      const targetScale = Math.max(t.scale, 1.2);
+      animateTo({ scale: targetScale, tx: size.w / 2 - ln.x * targetScale, ty: size.h / 2 - ln.y * targetScale }, 250);
+    }
+  }, [matchList, matchIndex, layout, size.w, size.h, searchQuery, pushRecentSearch]);
+
+  // Follow-live: when the live tip changes (and follow is on), re-center on it.
+  // Skips the animation if the tip is already on-screen with comfortable margin.
+  useEffect(() => {
+    if (!followLive || !liveTipId || !layout) return;
+    const tip = layout.nodes.get(liveTipId);
+    if (!tip) return;
+    const t = transformRef.current;
+    const sx = tip.x * t.scale + t.tx;
+    const sy = tip.y * t.scale + t.ty;
+    const margin = 80;
+    if (sx >= margin && sx <= size.w - margin && sy >= margin && sy <= size.h - margin) return;
+    panToLayoutPoint(tip.x, tip.y, 300);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followLive, liveTipId, layout, size.w, size.h]);
 
   // ───── Wheel + pinch ─────
   // Bind on the CANVAS ELEMENT (not document/window). Chromium silently forces
@@ -723,6 +1381,35 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     return () => { cancelled = true; };
   }, [selected, forest]);
 
+  // Push selection changes into the back/forward history. Skips the push when
+  // navigatingHistoryRef is true so alt+left/right doesn't recursively re-push.
+  // Capped at 50 entries to bound memory.
+  useEffect(() => {
+    if (selected == null) return;
+    if (navigatingHistoryRef.current) { navigatingHistoryRef.current = false; return; }
+    const h = selectionHistoryRef.current;
+    if (h.entries[h.cursor] === selected) return; // no-op selection of same
+    h.entries = h.entries.slice(0, h.cursor + 1);
+    h.entries.push(selected);
+    if (h.entries.length > 50) h.entries = h.entries.slice(-50);
+    h.cursor = h.entries.length - 1;
+  }, [selected]);
+
+  const navigateHistory = useCallback((dir: -1 | 1) => {
+    const h = selectionHistoryRef.current;
+    const next = h.cursor + dir;
+    if (next < 0 || next >= h.entries.length) return;
+    h.cursor = next;
+    const id = h.entries[next]!;
+    navigatingHistoryRef.current = true;
+    setSelected(id);
+    const ln = layout?.nodes.get(id);
+    if (ln) {
+      const t = transformRef.current;
+      animateTo({ scale: t.scale, tx: size.w / 2 - ln.x * t.scale, ty: size.h / 2 - ln.y * t.scale }, 250);
+    }
+  }, [layout, size.w, size.h]);
+
   // Gmail-style chord state: when `g` is pressed, the next key within 1.5s is interpreted as a chord
   const chordRef = useRef<{ pending: boolean; timer: number | null }>({ pending: false, timer: null });
 
@@ -766,8 +1453,25 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     };
 
     const onKey = (e: KeyboardEvent) => {
+      // Cmd/Ctrl+K opens the command palette from anywhere (even inside inputs)
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        if (document.activeElement?.tagName === "INPUT" || document.activeElement?.tagName === "TEXTAREA") {
+          (document.activeElement as HTMLElement).blur();
+        }
+        setPaletteOpen((v) => !v);
+        return;
+      }
       if (document.activeElement?.tagName === "INPUT" || document.activeElement?.tagName === "TEXTAREA") {
         if (e.key === "Escape") (document.activeElement as HTMLElement).blur();
+        return;
+      }
+      // Alt+left/right = browser-style selection history (back/forward).
+      // Takes priority over the plain arrow-key navigation so the modifier
+      // version doesn't fall through to "cycle within session."
+      if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        e.preventDefault();
+        navigateHistory(e.key === "ArrowLeft" ? -1 : 1);
         return;
       }
       // Arrow keys: cycle through visible nodes in the active session (or selected's session)
@@ -903,6 +1607,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         case "Escape":
           if (helpOpen) setHelpOpen(false);
           else if (searchOpen) { setSearchOpen(false); setSearchQuery(""); }
+          else if (multiSelected.size > 0) setMultiSelected(new Set());
           else if (selected) setSelected(null);
           else onClose();
           break;
@@ -910,32 +1615,58 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [layout, size, forest, selected, helpOpen, searchOpen, onClose, effectiveActiveSession, liveTipId, mode, scopeProject, toggleBookmark]);
+  }, [layout, size, forest, selected, helpOpen, searchOpen, onClose, effectiveActiveSession, liveTipId, mode, scopeProject, toggleBookmark, multiSelected, navigateHistory]);
 
   // ───── Tooltip data ─────
+  // Enriched in timeline mode with gap-from-prev; assistant nodes include
+  // their output-token cost so heat-map values are interpretable on hover.
   const tooltipData = useMemo(() => {
     if (!hovered || !forest) return null;
     if (hovered.kind === "node") {
       const n = forest.nodes.find((x) => x.id === hovered.id);
       if (!n) return null;
+      const gapMs = layout?.nodeGapToPrev?.get(n.id);
+      const metaParts: string[] = [
+        new Date(n.timestamp).toLocaleString(),
+        n.sessionId.slice(0, 8),
+      ];
+      if (n.role === "assistant" && n.outputTokens > 0) {
+        metaParts.push(`${n.outputTokens.toLocaleString()} out`);
+      }
+      if (gapMs && gapMs >= 60_000) {
+        metaParts.push(`+${humanGap(gapMs)} since prev`);
+      }
       return {
         kind: "node" as const,
-        title: n.role === "assistant" ? "assistant" : (n.subtype ?? "user"),
+        title: n.role === "assistant"
+          ? (n.subtype === "tool-only" ? "assistant · tool call" : n.subtype === "thinking" ? "assistant · thinking" : "assistant")
+          : (n.subtype ?? "user"),
         body: n.preview || "(empty)",
-        meta: `${new Date(n.timestamp).toLocaleString()} · ${n.sessionId.slice(0, 8)}`,
-        color: n.role === "assistant" ? "#fbbf24" : n.subtype === "prompt" ? "#34d399" : "#71717a",
+        meta: metaParts.join(" · "),
+        color: n.isSidechain ? "#c084fc" : n.role === "assistant" ? "#fbbf24" : n.subtype === "prompt" ? "#34d399" : "#71717a",
+        isSidechain: n.isSidechain,
       };
     } else {
       const band = layout?.sessionBands.find((b) => b.sessionId === hovered.id);
       if (!band) return null;
       const sess = forest.nodes.find((x) => x.sessionId === hovered.id);
+      const titleInfo = forest.sessionTitles?.[band.sessionId];
+      const totalTokens = titleInfo
+        ? titleInfo.tokens.input + titleInfo.tokens.output
+        : 0;
+      const metaParts = [
+        band.sessionId.slice(0, 8),
+        `${band.nodeCount} nodes`,
+      ];
+      if (totalTokens > 0) metaParts.push(`${formatTokens(totalTokens)} tok`);
       return {
         kind: "session" as const,
         title: prettySlug(band.projectSlug),
-        body: band.firstPrompt || "(no user prompt yet)",
-        meta: `${band.sessionId.slice(0, 8)} · ${band.nodeCount} nodes`,
+        body: titleInfo?.aiTitle || band.firstPrompt || "(no user prompt yet)",
+        meta: metaParts.join(" · "),
         color: projectColor(band.projectSlug),
         sess,
+        isSidechain: false,
       };
     }
   }, [hovered, forest, layout]);
@@ -950,7 +1681,34 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   return (
     <div className="flex-1 flex overflow-hidden relative">
       {/* Sidebar */}
-      <div className="w-56 border-r border-zinc-800 bg-zinc-950 p-3 space-y-3 text-sm overflow-y-auto shrink-0">
+      <div className="w-56 border-r border-zinc-800 bg-zinc-950 p-3 text-sm overflow-y-auto shrink-0">
+        {/* Collapse-all / expand-all — compact the sidebar to maximize canvas */}
+        <div className="flex justify-end pb-1 -mt-1">
+          <button
+            onClick={() => setAllGroupsOpen(false)}
+            className="text-zinc-500 hover:text-zinc-200 text-[10px] px-1.5 py-0.5 rounded hover:bg-zinc-900"
+            title="Collapse all sidebar groups"
+          >
+            collapse all
+          </button>
+          <button
+            onClick={() => setAllGroupsOpen(true)}
+            className="text-zinc-500 hover:text-zinc-200 text-[10px] px-1.5 py-0.5 rounded hover:bg-zinc-900 ml-1"
+            title="Expand all sidebar groups"
+          >
+            expand all
+          </button>
+        </div>
+        <div key={sidebarKey}>
+        <SidebarGroup
+          id="scope"
+          title="Scope"
+          summary={
+            (activeSpace ? activeSpace.name : null) ??
+            (mode === "per-project" && scopeProject ? prettySlug(scopeProject) : null) ??
+            "all projects"
+          }
+        >
         <div>
           <div className="text-zinc-500 text-xs mb-1">View</div>
           <div className="flex gap-1">
@@ -968,76 +1726,43 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             </button>
           </div>
         </div>
-        {mode === "per-project" && (
-          <div>
-            <div className="text-zinc-500 text-xs mb-1">Project ({forest.projects.length})</div>
-            <div className="space-y-0.5 max-h-[60vh] overflow-y-auto">
-              {[...forest.projects].sort((a, b) => b.sessionCount - a.sessionCount).map((p) => (
-                <button
-                  key={p.slug}
-                  onClick={() => setScopeProject(p.slug)}
-                  className={`w-full text-left px-2 py-1 rounded text-xs truncate flex items-center gap-2 ${scopeProject === p.slug ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-800"}`}
-                  title={p.slug}
-                >
-                  <span className="inline-block w-2 h-2 rounded-sm shrink-0" style={{ background: projectColor(p.slug) }} />
-                  <span className="truncate flex-1">{prettySlug(p.slug)}</span>
-                  <span className="text-zinc-600 shrink-0">{p.sessionCount}</span>
-                </button>
-              ))}
+        {mode === "per-project" && (() => {
+          const sorted = [...forest.projects].sort((a, b) => b.sessionCount - a.sessionCount);
+          const maxCount = sorted.length > 0 ? sorted[0]!.sessionCount : 0;
+          return (
+            <div>
+              <div className="text-zinc-500 text-xs mb-1">Project ({forest.projects.length})</div>
+              <div className="space-y-0.5 max-h-[40vh] overflow-y-auto">
+                {sorted.map((p) => {
+                  const ratio = maxCount > 0 ? p.sessionCount / maxCount : 0;
+                  const isActive = scopeProject === p.slug;
+                  return (
+                    <button
+                      key={p.slug}
+                      onClick={() => setScopeProject(p.slug)}
+                      className={`relative w-full text-left px-2 py-1 rounded text-xs truncate flex items-center gap-2 overflow-hidden ${isActive ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-800"}`}
+                      title={`${p.slug} · ${p.sessionCount} sessions`}
+                    >
+                      <span
+                        className="absolute left-0 top-0 bottom-0 pointer-events-none"
+                        style={{
+                          width: `${Math.max(2, ratio * 100)}%`,
+                          background: projectColor(p.slug),
+                          opacity: isActive ? 0.25 : 0.15,
+                        }}
+                      />
+                      <span className="relative inline-block w-2 h-2 rounded-sm shrink-0" style={{ background: projectColor(p.slug) }} />
+                      <span className="relative truncate flex-1">{prettySlug(p.slug)}</span>
+                      <span className="relative text-zinc-600 shrink-0 tabular-nums">{p.sessionCount}</span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        )}
-        <div className="pt-2 border-t border-zinc-800">
-          <div className="text-zinc-500 text-xs mb-1">Layout</div>
-          <div className="flex gap-1">
-            {(["grid", "column"] as const).map((d) => (
-              <button
-                key={d}
-                onClick={() => setDirection(d)}
-                className={`px-2 py-1 rounded text-xs flex-1 ${direction === d ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
-                title={d === "grid" ? "trees wrap into rows (square-ish)" : "each session on its own row, stacked top to bottom"}
-              >
-                {d}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="pt-2 border-t border-zinc-800">
-          <div className="text-zinc-500 text-xs mb-1">Nodes</div>
-          <div className="flex gap-1">
-            {(["dots", "cards"] as const).map((s) => (
-              <button
-                key={s}
-                onClick={() => setNodeStyle(s)}
-                className={`px-2 py-1 rounded text-xs flex-1 ${nodeStyle === s ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
-                title={s === "dots" ? "small dots — fast, good for overview" : "text cards — preview content in-place, layout is much larger"}
-              >
-                {s}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="pt-2 border-t border-zinc-800">
-          <div className="text-zinc-500 text-xs mb-1">Input</div>
-          <div className="flex gap-1">
-            {(["auto", "mouse", "trackpad"] as const).map((m) => (
-              <button
-                key={m}
-                onClick={() => setInputMode(m)}
-                className={`px-2 py-1 rounded text-xs flex-1 ${inputMode === m ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
-                title={
-                  m === "mouse" ? "plain wheel = zoom" :
-                  m === "trackpad" ? "plain wheel = pan; ctrl/pinch = zoom" :
-                  "auto-detect by event magnitude"
-                }
-              >
-                {m}
-              </button>
-            ))}
-          </div>
-        </div>
-        {/* Spaces (top-level workspaces) */}
-        <div className="pt-2 border-t border-zinc-800">
+          );
+        })()}
+        {/* Spaces (moved from below Input so it sits in the Scope group) */}
+        <div>
           <div className="flex items-center justify-between mb-1">
             <span className="text-zinc-500 text-xs">Spaces</span>
             <button
@@ -1062,7 +1787,6 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             </button>
           </div>
           <div className="space-y-0.5">
-            {/* Special "All sessions" option */}
             <button
               onClick={() => setActiveSpaceId(null)}
               className={`w-full text-left px-2 py-1 rounded text-xs flex items-center gap-2 ${activeSpaceId === null ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-900"}`}
@@ -1074,9 +1798,10 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             {spaces.map((sp) => (
               <div key={sp.id} className="group flex items-center gap-1">
                 <button
+                  data-space-id={sp.id}
                   onClick={() => setActiveSpaceId(sp.id)}
-                  className={`flex-1 text-left px-2 py-1 rounded text-xs flex items-center gap-2 ${activeSpaceId === sp.id ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-900"}`}
-                  title={sp.note || sp.name}
+                  className={`flex-1 text-left px-2 py-1 rounded text-xs flex items-center gap-2 ${activeSpaceId === sp.id ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-900"} ${dragSession && dragOverSpaceId === sp.id ? "ring-2 ring-emerald-400 bg-emerald-900/40" : ""}`}
+                  title={dragSession ? `Drop to add session to "${sp.name}"` : sp.note || sp.name}
                 >
                   <span className="inline-block w-2 h-2 rounded-sm shrink-0" style={{ background: `hsl(${sp.hue}, 60%, 55%)` }} />
                   <span className="truncate flex-1">{sp.name}</span>
@@ -1108,10 +1833,140 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             ))}
           </div>
         </div>
-        {/* Faceted filter */}
-        <div className="pt-2 border-t border-zinc-800 space-y-1">
+        </SidebarGroup>
+
+        <SidebarGroup
+          id="display"
+          title="Display"
+          summary={`${direction} · ${nodeStyle} · ${colorMode}`}
+        >
+        <div>
+          <div className="text-zinc-500 text-xs mb-1">Layout</div>
+          <div className="flex gap-1">
+            {(["grid", "column", "timeline"] as const).map((d) => (
+              <button
+                key={d}
+                onClick={() => setDirection(d)}
+                className={`px-2 py-1 rounded text-xs flex-1 ${direction === d ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+                title={
+                  d === "grid" ? "trees wrap into rows (square-ish)" :
+                  d === "column" ? "each session on its own row, prompts vertical, replies horizontal" :
+                  "one column per session; Y is real time — reveals burst sessions and idle gaps"
+                }
+              >
+                {d}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div className="text-zinc-500 text-xs mb-1">Nodes</div>
+          <div className="flex gap-1">
+            {(["dots", "cards"] as const).map((s) => (
+              <button
+                key={s}
+                onClick={() => setNodeStyle(s)}
+                className={`px-2 py-1 rounded text-xs flex-1 ${nodeStyle === s ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+                title={s === "dots" ? "small dots — fast, good for overview" : "text cards — preview content in-place, layout is much larger"}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div className="text-zinc-500 text-xs mb-1">Color by</div>
+          <div className="flex gap-1">
+            {(["role", "recency", "cost"] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => setColorMode(m)}
+                className={`px-2 py-1 rounded text-xs flex-1 ${colorMode === m ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+                title={
+                  m === "role" ? "user/assistant/subagent colors" :
+                  m === "recency" ? "heat map: old → recent (gray → emerald)" :
+                  "heat map: assistant output tokens (gray → red)"
+                }
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        </div>
+        </SidebarGroup>
+
+        <SidebarGroup
+          id="live"
+          title="Live"
+          summary={`follow ${followLive ? "on" : "off"} · ${inputMode}`}
+        >
+        <div className="space-y-1">
+          <div className="text-zinc-500 text-xs mb-1">Follow live</div>
+          <button
+            onClick={() => setFollowLive((v) => !v)}
+            className={`w-full px-2 py-1 rounded text-xs flex items-center justify-between gap-2 ${followLive ? "bg-emerald-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+            title="When on, the map auto-pans to keep the latest live message in view"
+          >
+            <span className="flex items-center gap-1.5">
+              <span className={`inline-block w-1.5 h-1.5 rounded-full ${followLive ? "bg-emerald-300 animate-pulse" : "bg-zinc-600"}`} />
+              follow live
+            </span>
+            <span className="text-[10px] opacity-75">{followLive ? "ON" : "OFF"}</span>
+          </button>
+          {direction === "timeline" && layout?.timelineAnchors && effectiveActiveSession && layout.timelineAnchors.has(effectiveActiveSession) && (
+            <button
+              onClick={() => {
+                const anchor = layout.timelineAnchors!.get(effectiveActiveSession!);
+                if (!anchor) return;
+                const nowY = timelineNowY(anchor, Date.now());
+                const cx = (anchor.x + anchor.xRight) / 2;
+                panToLayoutPoint(cx, nowY, 350);
+              }}
+              className="w-full px-2 py-1 rounded text-xs bg-zinc-900 text-zinc-400 hover:bg-zinc-800 flex items-center justify-between"
+              title="Pan to the 'right now' line in the active session column"
+            >
+              <span>today / now</span>
+              <span className="text-[10px] opacity-75">→</span>
+            </button>
+          )}
+        </div>
+        <div>
+          <div className="text-zinc-500 text-xs mb-1">Input</div>
+          <div className="flex gap-1">
+            {(["auto", "mouse", "trackpad"] as const).map((m) => (
+              <button
+                key={m}
+                onClick={() => setInputMode(m)}
+                className={`px-2 py-1 rounded text-xs flex-1 ${inputMode === m ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+                title={
+                  m === "mouse" ? "plain wheel = zoom" :
+                  m === "trackpad" ? "plain wheel = pan; ctrl/pinch = zoom" :
+                  "auto-detect by event magnitude"
+                }
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        </div>
+        </SidebarGroup>
+
+        <SidebarGroup
+          id="filter"
+          title="Filter"
+          summary={(() => {
+            const parts: string[] = [];
+            if (filter.startDate || filter.endDate) parts.push(`date`);
+            if (filter.requiredTools.length > 0) parts.push(`${filter.requiredTools.length} tool${filter.requiredTools.length === 1 ? "" : "s"}`);
+            if (filter.bookmarkedOnly) parts.push("★");
+            const visChanged = JSON.stringify(visibility) !== JSON.stringify(DEFAULT_VISIBILITY);
+            if (visChanged) parts.push("show*");
+            return parts.length === 0 ? "none" : parts.join(" · ");
+          })()}
+        >
+        <div className="space-y-1">
           <div className="flex items-center justify-between mb-1">
-            <span className="text-zinc-500 text-xs">Filter sessions</span>
+            <span className="text-zinc-500 text-xs">Sessions</span>
             {(filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly) && (
               <button
                 onClick={() => updateFilter({ startDate: null, endDate: null, requiredTools: [], bookmarkedOnly: false })}
@@ -1178,7 +2033,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             </div>
           )}
         </div>
-        <div className="pt-2 border-t border-zinc-800">
+        <div>
           <div className="text-zinc-500 text-xs mb-1">Show</div>
           <VisToggle label="Prompts"        color="#34d399" on={visibility.prompt}        onChange={() => toggleVisibility("prompt")} />
           <VisToggle label="Replies (text)" color="#fbbf24" on={visibility.assistantText} onChange={() => toggleVisibility("assistantText")} />
@@ -1189,70 +2044,143 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           <VisToggle label="Slash commands" color="#71717a" on={visibility.slashCommand}  onChange={() => toggleVisibility("slashCommand")} />
           <VisToggle label="System reminders" color="#3f3f46" on={visibility.systemReminder} onChange={() => toggleVisibility("systemReminder")} />
         </div>
-        <div className="text-xs text-zinc-500 pt-2 border-t border-zinc-800 space-y-1">
-          {/* Quick reset */}
-          {(filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly ||
-            JSON.stringify(visibility) !== JSON.stringify(DEFAULT_VISIBILITY)) && (
-            <button
-              onClick={() => {
-                updateFilter({ startDate: null, endDate: null, requiredTools: [], bookmarkedOnly: false });
-                setVisibility(DEFAULT_VISIBILITY);
-                try {
-                  localStorage.setItem("cc-map-visibility", JSON.stringify(DEFAULT_VISIBILITY));
-                } catch {}
-              }}
-              className="w-full text-left text-xs text-zinc-400 hover:text-zinc-100 underline mb-1"
-              title="reset all visibility + filter settings"
-            >
-              ↺ reset filters & visibility
-            </button>
-          )}
-          {effectiveActiveSession && (() => {
-            const liveBand = layout?.sessionBands.find((b) => b.sessionId === effectiveActiveSession);
-            const liveProj = forest.nodes.find((n) => n.sessionId === effectiveActiveSession)?.projectSlug ?? "";
-            const liveTitle = forest.sessionTitles?.[effectiveActiveSession]?.aiTitle;
-            // Latest meaningful message preview — show what just happened
-            const latestNode = liveTipId ? forest.nodes.find((n) => n.id === liveTipId) : null;
-            return (
-              <button
-                className="flex flex-col items-start gap-1 w-full text-left p-2 -mx-1 rounded hover:bg-zinc-900 border border-emerald-900/40"
-                onClick={() => {
-                  if (!layout) return;
-                  if (mode === "per-project" && liveProj && liveProj !== scopeProject) {
-                    setScopeProject(liveProj);
-                  } else if (liveBand) {
-                    animateTo(fitToBounds(liveBand, size.w, size.h, 80));
-                  }
-                }}
-                title={`session ${effectiveActiveSession}\n${liveProj}`}
-              >
-                <div className="flex items-center gap-2">
-                  <span className="relative flex h-2 w-2 shrink-0">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                  </span>
-                  <span className="text-emerald-400 font-mono text-[10px]">live</span>
-                </div>
-                {liveTitle ? (
-                  <div className="text-zinc-200 text-xs leading-tight line-clamp-2 w-full">{liveTitle}</div>
-                ) : (
-                  <div className="text-zinc-300 text-xs font-mono">{effectiveActiveSession.slice(0, 8)}</div>
-                )}
-                <div className="text-zinc-500 text-[10px] truncate w-full" title={liveProj}>{prettySlug(liveProj)}</div>
-                {latestNode && (
-                  <div className="text-zinc-400 text-[10px] line-clamp-2 leading-tight w-full pt-1 border-t border-zinc-800/60 mt-1">
-                    <span className={latestNode.role === "assistant" ? "text-amber-400" : "text-emerald-400"}>
-                      {latestNode.role === "assistant" ? "→ " : "← "}
+        {(filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly ||
+          JSON.stringify(visibility) !== JSON.stringify(DEFAULT_VISIBILITY)) && (
+          <button
+            onClick={() => {
+              updateFilter({ startDate: null, endDate: null, requiredTools: [], bookmarkedOnly: false });
+              setVisibility(DEFAULT_VISIBILITY);
+              try {
+                localStorage.setItem("cc-map-visibility", JSON.stringify(DEFAULT_VISIBILITY));
+              } catch {}
+            }}
+            className="w-full text-left text-xs text-zinc-400 hover:text-zinc-100 underline"
+            title="reset all visibility + filter settings"
+          >
+            ↺ reset filters & visibility
+          </button>
+        )}
+        </SidebarGroup>
+
+        {effectiveActiveSession && (
+          <SidebarGroup id="live-card" title="Live session">
+            {(() => {
+              const liveBand = layout?.sessionBands.find((b) => b.sessionId === effectiveActiveSession);
+              const liveProj = forest.nodes.find((n) => n.sessionId === effectiveActiveSession)?.projectSlug ?? "";
+              const liveTitle = forest.sessionTitles?.[effectiveActiveSession]?.aiTitle;
+              const latestNode = liveTipId ? forest.nodes.find((n) => n.id === liveTipId) : null;
+              return (
+                <button
+                  className="flex flex-col items-start gap-1 w-full text-left p-2 rounded hover:bg-zinc-900 border border-emerald-900/40"
+                  onClick={() => {
+                    if (!layout) return;
+                    if (mode === "per-project" && liveProj && liveProj !== scopeProject) {
+                      setScopeProject(liveProj);
+                    } else if (liveBand) {
+                      animateTo(fitToBounds(liveBand, size.w, size.h, 80));
+                    }
+                  }}
+                  title={`session ${effectiveActiveSession}\n${liveProj}`}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="relative flex h-2 w-2 shrink-0">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                     </span>
-                    {latestNode.preview || "(no preview)"}
+                    <span className="text-emerald-400 font-mono text-[10px]">live</span>
                   </div>
-                )}
+                  {liveTitle ? (
+                    <div className="text-zinc-200 text-xs leading-tight line-clamp-2 w-full">{liveTitle}</div>
+                  ) : (
+                    <div className="text-zinc-300 text-xs font-mono">{effectiveActiveSession.slice(0, 8)}</div>
+                  )}
+                  <div className="text-zinc-500 text-[10px] truncate w-full" title={liveProj}>{prettySlug(liveProj)}</div>
+                  {latestNode && (
+                    <div className="text-zinc-400 text-[10px] line-clamp-2 leading-tight w-full pt-1 border-t border-zinc-800/60 mt-1">
+                      <span className={latestNode.role === "assistant" ? "text-amber-400" : "text-emerald-400"}>
+                        {latestNode.role === "assistant" ? "→ " : "← "}
+                      </span>
+                      {latestNode.preview || "(no preview)"}
+                    </div>
+                  )}
+                </button>
+              );
+            })()}
+          </SidebarGroup>
+        )}
+
+        <SidebarGroup
+          id="saved"
+          title="Saved"
+          defaultOpen={false}
+          count={savedViews.length + bookmarks.size}
+          summary={`${savedViews.length} view${savedViews.length === 1 ? "" : "s"} · ${bookmarks.size} ★`}
+        >
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-zinc-500 text-xs">Views ({savedViews.length})</span>
+              <button
+                onClick={() => {
+                  const name = window.prompt("Name this view:", "");
+                  if (!name) return;
+                  const view: SavedView = {
+                    id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `v_${Date.now()}`,
+                    name,
+                    mode,
+                    scopeProject,
+                    filter,
+                    visibility,
+                    nodeStyle,
+                    direction,
+                    colorMode,
+                  };
+                  persistViews([...savedViews, view]);
+                }}
+                className="text-zinc-400 hover:text-zinc-200 text-xs px-1.5 py-0.5 rounded bg-zinc-900 hover:bg-zinc-800"
+                title="Save the current map state (filters, scope, layout, colors) as a named view"
+              >
+                + save
               </button>
-            );
-          })()}
-          {/* Bookmarks */}
+            </div>
+            {savedViews.length === 0 ? (
+              <div className="text-zinc-600 text-[10px] italic">no saved views</div>
+            ) : (
+              <div className="space-y-0.5 max-h-40 overflow-y-auto">
+                {savedViews.map((v) => (
+                  <div key={v.id} className="flex items-center gap-1 group">
+                    <button
+                      onClick={() => {
+                        setMode(v.mode);
+                        setScopeProject(v.scopeProject);
+                        setFilter(v.filter);
+                        setVisibility(v.visibility);
+                        setNodeStyle(v.nodeStyle);
+                        setDirection(v.direction);
+                        setColorMode(v.colorMode);
+                      }}
+                      className="flex-1 text-left px-2 py-0.5 rounded hover:bg-zinc-800 text-zinc-300 text-xs truncate"
+                      title={`${v.mode} · ${v.scopeProject ?? "all projects"} · ${v.nodeStyle} · ${v.direction} · ${v.colorMode}`}
+                    >
+                      {v.name}
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (window.confirm(`Delete view "${v.name}"?`)) {
+                          persistViews(savedViews.filter((x) => x.id !== v.id));
+                        }
+                      }}
+                      className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-400 text-xs px-1"
+                      title="Delete view"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
           {bookmarks.size > 0 && (
-            <div className="pt-2 border-t border-zinc-800">
+            <div>
               <div className="text-zinc-500 text-xs mb-1">★ Bookmarks ({bookmarks.size})</div>
               <div className="space-y-0.5 max-h-40 overflow-y-auto">
                 {[...bookmarks].map((bid) => {
@@ -1281,23 +2209,39 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               </div>
             </div>
           )}
-          {/* Token totals across all projects */}
-          {(() => {
-            const total = forest.projects.reduce((acc, p) => ({
-              input: acc.input + (p.tokens?.input ?? 0),
-              output: acc.output + (p.tokens?.output ?? 0),
-              cacheRead: acc.cacheRead + (p.tokens?.cacheRead ?? 0),
-            }), { input: 0, output: 0, cacheRead: 0 });
-            const total_b = (total.input + total.output + total.cacheRead) / 1e6;
-            return total_b > 0 ? (
-              <div className="text-zinc-500" title={`${total.input.toLocaleString()} input + ${total.output.toLocaleString()} output + ${total.cacheRead.toLocaleString()} cache-read`}>
-                ≈{total_b.toFixed(1)}M tokens total
-              </div>
-            ) : null;
-          })()}
-          <div>{layout?.nodes.size.toLocaleString() ?? 0} visible · {forest.nodes.length.toLocaleString()} total</div>
-          <div>{forest.sessionCount} sessions · {forest.forks.length} forks</div>
-          <button onClick={() => setHelpOpen(true)} className="mt-2 text-zinc-400 hover:text-zinc-200 underline">help (?)</button>
+        </SidebarGroup>
+
+        <SidebarGroup
+          id="activity"
+          title="Activity"
+          summary={`${forest.sessionCount} sessions`}
+        >
+          <div>
+            <div className="text-zinc-500 text-xs mb-1.5">Recent activity</div>
+            <DailyActivityHeatmap forest={forest} filter={filter} onPickDate={(iso) => updateFilter({ startDate: iso, endDate: iso })} />
+          </div>
+          <div className="text-xs text-zinc-500 space-y-1 pt-1">
+            {(() => {
+              const total = forest.projects.reduce((acc, p) => ({
+                input: acc.input + (p.tokens?.input ?? 0),
+                output: acc.output + (p.tokens?.output ?? 0),
+                cacheRead: acc.cacheRead + (p.tokens?.cacheRead ?? 0),
+              }), { input: 0, output: 0, cacheRead: 0 });
+              const total_b = (total.input + total.output + total.cacheRead) / 1e6;
+              return total_b > 0 ? (
+                <div className="text-zinc-500" title={`${total.input.toLocaleString()} input + ${total.output.toLocaleString()} output + ${total.cacheRead.toLocaleString()} cache-read`}>
+                  ≈{total_b.toFixed(1)}M tokens total
+                </div>
+              ) : null;
+            })()}
+            <div>{layout?.nodes.size.toLocaleString() ?? 0} visible · {forest.nodes.length.toLocaleString()} total</div>
+            <div>{forest.sessionCount} sessions · {forest.forks.length} forks</div>
+          </div>
+        </SidebarGroup>
+
+        </div>
+        <div className="pt-3">
+          <button onClick={() => setHelpOpen(true)} className="text-xs text-zinc-400 hover:text-zinc-200 underline">help (?)</button>
         </div>
       </div>
 
@@ -1327,27 +2271,59 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           }}
         />
 
-        {/* Tooltip — DOM overlay so it's always crisp + can show rich content */}
-        {tooltipData && cursor && (
+        {/* Tooltip — DOM overlay so it's always crisp + can show rich content.
+            Anchored with a small offset; flips left of cursor if it would overflow
+            the right edge. Suppressed when an inline card overlay is open since
+            that already shows the full content. */}
+        {tooltipData && cursor && !(nodeStyle === "cards" && selected) && (
           <div
-            className="absolute pointer-events-none z-20 bg-zinc-900/95 border border-zinc-700 rounded shadow-lg px-3 py-2 text-xs max-w-sm backdrop-blur"
-            style={{
-              left: Math.min(cursor.x + 14, (containerRef.current?.clientWidth ?? size.w) - 380),
-              top: Math.min(cursor.y + 14, (containerRef.current?.clientHeight ?? size.h) - 100),
-            }}
+            className="absolute pointer-events-none z-20 bg-zinc-900/95 border border-zinc-700 rounded shadow-lg px-3 py-2 text-xs w-80 backdrop-blur"
+            style={(() => {
+              const cw = containerRef.current?.clientWidth ?? size.w;
+              const ch = containerRef.current?.clientHeight ?? size.h;
+              const tipW = 320;
+              const tipH = 140;
+              const overflowRight = cursor.x + 14 + tipW > cw - 8;
+              const left = overflowRight ? Math.max(8, cursor.x - 14 - tipW) : cursor.x + 14;
+              const top = Math.min(cursor.y + 14, ch - tipH - 8);
+              return { left, top };
+            })()}
           >
-            <div className="flex items-center gap-2 mb-1">
+            <div className="flex items-center gap-2 mb-1.5">
               <span
-                className="inline-block w-2 h-2 rounded-sm"
+                className="inline-block w-2.5 h-2.5 rounded-sm shrink-0"
                 style={{ background: tooltipData.color }}
               />
-              <span className="font-mono text-zinc-400">{tooltipData.title}</span>
-              <span className="text-zinc-600">·</span>
-              <span className="text-zinc-500 text-[10px]">{tooltipData.meta}</span>
+              <span className="font-mono text-zinc-300 font-semibold">{tooltipData.title}</span>
+              {tooltipData.isSidechain && (
+                <span className="text-[9px] uppercase tracking-wider text-purple-300 bg-purple-950/60 px-1.5 py-0.5 rounded">subagent</span>
+              )}
             </div>
-            <div className="text-zinc-200 leading-tight line-clamp-3">{tooltipData.body}</div>
+            <div className="text-zinc-200 leading-snug line-clamp-5 mb-1.5">
+              {highlightMatches(tooltipData.body, searchQuery)}
+            </div>
+            <div className="text-[10px] text-zinc-500 font-mono leading-tight">{tooltipData.meta}</div>
           </div>
         )}
+
+        {/* Bookmark gutter (left edge) — stars at the screen-Y of each bookmark */}
+        <BookmarkGutter
+          bookmarks={bookmarks}
+          layout={layout}
+          viewportHeight={size.h}
+          getTransform={() => transformRef.current}
+          panToLayoutPoint={(lx, ly) => panToLayoutPoint(lx, ly, 300)}
+          onSelect={(id) => setSelected(id)}
+        />
+
+        {/* Minimap (top-right) */}
+        <Minimap
+          layout={layout}
+          viewportWidth={size.w}
+          viewportHeight={size.h}
+          getTransform={() => transformRef.current}
+          panToLayoutPoint={(lx, ly) => panToLayoutPoint(lx, ly, 250)}
+        />
 
         {/* Zoom overlay */}
         <ZoomOverlay
@@ -1374,7 +2350,8 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
 
         {/* Search overlay */}
         {searchOpen && (
-          <div className="absolute top-3 right-3 z-30 flex items-center gap-2 bg-zinc-900/95 border border-zinc-700 rounded px-2 py-1 backdrop-blur">
+          <div className="absolute top-3 right-3 z-30 bg-zinc-900/95 border border-zinc-700 rounded backdrop-blur min-w-[380px]">
+            <div className="flex items-center gap-2 px-2 py-1">
             <input
               autoFocus
               type="text"
@@ -1384,10 +2361,43 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
-                  // Fit to all match nodes
-                  if (matches && matches.size > 0 && layout) {
+                  e.preventDefault();
+                  // Shift+Enter steps backward; Enter steps forward.
+                  stepMatch(e.shiftKey ? -1 : 1);
+                } else if (e.key === "ArrowDown" || (e.key === "n" && (e.ctrlKey || e.metaKey))) {
+                  e.preventDefault();
+                  stepMatch(1);
+                } else if (e.key === "ArrowUp" || (e.key === "p" && (e.ctrlKey || e.metaKey))) {
+                  e.preventDefault();
+                  stepMatch(-1);
+                }
+              }}
+            />
+            {matchList.length > 0 ? (
+              <>
+                <button
+                  className="text-zinc-400 hover:text-zinc-100 text-xs px-1.5 rounded hover:bg-zinc-800"
+                  onClick={() => stepMatch(-1)}
+                  title="Previous match (shift+enter)"
+                >
+                  ↑
+                </button>
+                <span className="text-xs text-zinc-300 font-mono tabular-nums">
+                  {matchIndex + 1}<span className="text-zinc-600">/</span>{matchList.length}
+                </span>
+                <button
+                  className="text-zinc-400 hover:text-zinc-100 text-xs px-1.5 rounded hover:bg-zinc-800"
+                  onClick={() => stepMatch(1)}
+                  title="Next match (enter)"
+                >
+                  ↓
+                </button>
+                <button
+                  className="text-zinc-500 hover:text-zinc-200 text-[10px] underline ml-1"
+                  onClick={() => {
+                    if (!layout) return;
                     let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
-                    for (const id of matches) {
+                    for (const id of matchList) {
                       const n = layout.nodes.get(id);
                       if (!n) continue;
                       if (n.x < mnx) mnx = n.x;
@@ -1396,13 +2406,17 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                       if (n.y > mxy) mxy = n.y;
                     }
                     if (mxx > mnx) animateTo(fitToBounds({ minX: mnx, minY: mny, maxX: mxx, maxY: mxy }, size.w, size.h, 80));
-                  }
-                }
-              }}
-            />
-            <span className="text-xs text-zinc-500 font-mono">
-              {matches ? `${matches.size} match${matches.size === 1 ? "" : "es"}` : ""}
-            </span>
+                  }}
+                  title="Zoom out to fit all matches"
+                >
+                  fit all
+                </button>
+              </>
+            ) : (
+              <span className="text-xs text-zinc-600 font-mono">
+                {searchQuery ? "0 matches" : ""}
+              </span>
+            )}
             <button
               className="text-zinc-500 hover:text-zinc-200 text-xs px-1"
               onClick={() => { setSearchOpen(false); setSearchQuery(""); }}
@@ -1410,17 +2424,281 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             >
               ✕
             </button>
+            </div>
+
+            {/* Recent searches — only shown when the input is empty (acts as
+                a suggestion list). Click to re-run, ✕ to remove. */}
+            {!searchQuery.trim() && recentSearches.length > 0 && (
+              <div className="border-t border-zinc-800 py-1 max-h-56 overflow-y-auto">
+                <div className="px-3 pt-1 pb-1 text-[10px] uppercase tracking-wider text-zinc-500 font-mono">Recent</div>
+                {recentSearches.map((q) => (
+                  <div key={q} className="group flex items-center px-2 hover:bg-zinc-800/50">
+                    <button
+                      className="flex-1 text-left text-xs text-zinc-300 px-1 py-1 truncate"
+                      onClick={() => setSearchQuery(q)}
+                      title={`Search for "${q}"`}
+                    >
+                      <span className="text-zinc-500 mr-2">↻</span>
+                      {q}
+                    </button>
+                    <button
+                      className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-400 text-xs px-1"
+                      onClick={() => removeRecentSearch(q)}
+                      title="Remove from recents"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
-        {/* LOD indicator (subtle, top-center) */}
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 text-xs text-zinc-500 font-mono pointer-events-none bg-zinc-900/70 backdrop-blur rounded px-2 py-0.5">
+        {/* Color legend (only when heat-map mode is active) */}
+        {colorMode !== "role" && layout && layout.nodes.size > 0 && (
+          <ColorLegend mode={colorMode} layout={layout} />
+        )}
+
+        {/* Empty state — when filters/scope/visibility have excluded everything,
+            the canvas goes black with no explanation. Tell the user what's
+            wrong and offer one-click rescue. */}
+        {layout && layout.nodes.size === 0 && forest.nodes.length > 0 && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
+            <div className="pointer-events-auto bg-zinc-900/95 border border-zinc-700 rounded-lg p-5 max-w-sm text-center space-y-3 shadow-xl backdrop-blur">
+              <div className="text-zinc-200 text-sm">
+                {(() => {
+                  const filterActive = filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly;
+                  if (activeSpace && activeSpace.sessionIds.length === 0) return `Space "${activeSpace.name}" has no sessions yet`;
+                  if (activeSpace) return `No sessions in "${activeSpace.name}" match the current filter`;
+                  if (filterActive) return "No sessions match the current filter";
+                  if (mode === "per-project" && scopeProject) return `No visible nodes in "${prettySlug(scopeProject)}" — try the visibility toggles below`;
+                  return "No visible nodes — adjust the visibility filter to show messages";
+                })()}
+              </div>
+              <div className="flex gap-2 justify-center text-xs">
+                {(filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly) && (
+                  <button
+                    className="px-3 py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 text-white"
+                    onClick={() => updateFilter({ startDate: null, endDate: null, requiredTools: [], bookmarkedOnly: false })}
+                  >
+                    clear filter
+                  </button>
+                )}
+                {activeSpaceId && (
+                  <button
+                    className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200"
+                    onClick={() => setActiveSpaceId(null)}
+                  >
+                    exit space
+                  </button>
+                )}
+                {mode === "per-project" && scopeProject && (
+                  <button
+                    className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200"
+                    onClick={() => setMode("all-projects")}
+                  >
+                    view all projects
+                  </button>
+                )}
+                <button
+                  className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200"
+                  onClick={() => setVisibility(DEFAULT_VISIBILITY)}
+                >
+                  reset visibility
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Active scope pills (top-center, above LOD) — show what's narrowing
+            the view so empty results don't feel mysterious. Click × to clear. */}
+        {(activeSpace || (mode === "per-project" && scopeProject)) && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 -translate-y-1">
+            {activeSpace && (
+              <button
+                className="group flex items-center gap-1.5 px-2 py-1 rounded bg-zinc-900/95 border border-zinc-700 hover:border-zinc-500 text-xs text-zinc-200 backdrop-blur shadow"
+                onClick={() => setActiveSpaceId(null)}
+                title="Clear space filter"
+              >
+                <span
+                  className="inline-block w-2 h-2 rounded-sm"
+                  style={{ background: `hsl(${activeSpace.hue}, 60%, 55%)` }}
+                />
+                <span>✦ {activeSpace.name}</span>
+                <span className="text-zinc-500">·</span>
+                <span className="text-zinc-500 text-[10px]">{activeSpace.sessionIds.length} sessions</span>
+                <span className="text-zinc-500 group-hover:text-red-400 ml-1">×</span>
+              </button>
+            )}
+            {mode === "per-project" && scopeProject && (
+              <button
+                className="group flex items-center gap-1.5 px-2 py-1 rounded bg-zinc-900/95 border border-zinc-700 hover:border-zinc-500 text-xs text-zinc-200 backdrop-blur shadow"
+                onClick={() => setMode("all-projects")}
+                title="Switch to all-projects view"
+              >
+                <span
+                  className="inline-block w-2 h-2 rounded-sm"
+                  style={{ background: projectColor(scopeProject) }}
+                />
+                <span>📁 {prettySlug(scopeProject)}</span>
+                <span className="text-zinc-500 group-hover:text-red-400 ml-1">×</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* LOD indicator (subtle, top-center; nudged down when scope pills are
+            occupying that spot). Pointer-events disabled so it's purely an info
+            badge that doesn't intercept clicks. */}
+        <div
+          className={`absolute left-1/2 -translate-x-1/2 z-10 text-[10px] text-zinc-500 font-mono pointer-events-none bg-zinc-900/70 backdrop-blur rounded px-2 py-0.5 ${
+            activeSpace || (mode === "per-project" && scopeProject) ? "top-12" : "top-3"
+          }`}
+        >
           {lodOf(transformRef.current.scale)}
         </div>
+
+        {/* Multi-select action bar (bottom-center) — appears when ctrl/cmd+click
+            has accumulated 1+ nodes. Bulk bookmark + add-to-Space + clear. */}
+        {multiSelected.size > 0 && (
+          <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-3 py-2 rounded bg-zinc-900/95 border border-cyan-700 text-xs text-zinc-200 backdrop-blur shadow-xl">
+            <span className="font-mono text-cyan-300 tabular-nums">{multiSelected.size}</span>
+            <span className="text-zinc-400">selected</span>
+            <span className="text-zinc-700">·</span>
+            <button
+              className="px-2 py-1 rounded hover:bg-zinc-800 text-amber-400"
+              onClick={() => {
+                setBookmarks((prev) => {
+                  const next = new Set(prev);
+                  for (const id of multiSelected) next.add(id);
+                  try { localStorage.setItem("cc-map-bookmarks", JSON.stringify([...next])); } catch {}
+                  return next;
+                });
+                setMultiSelected(new Set());
+              }}
+              title="Bookmark all selected"
+            >
+              ★ bookmark all
+            </button>
+            {spaces.length > 0 && (
+              <details className="relative">
+                <summary className="px-2 py-1 rounded hover:bg-zinc-800 cursor-pointer list-none text-emerald-400">+ add to space ▾</summary>
+                <div className="absolute bottom-full mb-1 right-0 bg-zinc-900 border border-zinc-700 rounded shadow-xl py-1 min-w-[160px]">
+                  {spaces.map((sp) => (
+                    <button
+                      key={sp.id}
+                      className="w-full text-left px-2 py-1 hover:bg-zinc-800 text-zinc-200 flex items-center gap-1.5"
+                      onClick={() => {
+                        const sessionIds = new Set<string>();
+                        for (const nodeId of multiSelected) {
+                          const n = forest?.nodes.find((x) => x.id === nodeId);
+                          if (n) sessionIds.add(n.sessionId);
+                        }
+                        const combined = [...new Set([...sp.sessionIds, ...sessionIds])];
+                        upsertSpace({ ...sp, sessionIds: combined });
+                        setMultiSelected(new Set());
+                      }}
+                    >
+                      <span className="inline-block w-2 h-2 rounded-sm" style={{ background: `hsl(${sp.hue}, 60%, 55%)` }} />
+                      {sp.name}
+                    </button>
+                  ))}
+                </div>
+              </details>
+            )}
+            <span className="text-zinc-700">·</span>
+            <button
+              className="px-2 py-1 rounded hover:bg-zinc-800 text-zinc-400"
+              onClick={() => setMultiSelected(new Set())}
+              title="Clear selection (esc)"
+            >
+              clear
+            </button>
+          </div>
+        )}
+
+        {/* Recent activity toasts (bottom-right, stacked) */}
+        {activityToasts.length > 0 && (
+          <div className="absolute bottom-3 right-3 z-30 flex flex-col-reverse gap-2 max-w-xs pointer-events-none">
+            {activityToasts.map((t) => {
+              const age = Date.now() - t.receivedMs;
+              const fadeOpacity = Math.max(0, 1 - age / TOAST_TTL_MS);
+              return (
+                <button
+                  key={t.nodeId}
+                  className="pointer-events-auto text-left px-3 py-2 rounded shadow-xl bg-zinc-900/95 border border-zinc-700 hover:border-emerald-500 transition-all"
+                  style={{ opacity: 0.4 + 0.6 * fadeOpacity }}
+                  onClick={() => {
+                    setSelected(t.nodeId);
+                    const ln = layout?.nodes.get(t.nodeId);
+                    if (ln) panToLayoutPoint(ln.x, ln.y, 350);
+                    setActivityToasts((prev) => prev.filter((x) => x.nodeId !== t.nodeId));
+                  }}
+                  title="Click to jump to this message"
+                >
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    <span
+                      className="inline-block w-1.5 h-1.5 rounded-sm"
+                      style={{ background: projectColor(t.projectSlug) }}
+                    />
+                    <span className="text-[10px] uppercase tracking-wide font-mono text-zinc-400">
+                      {t.role === "assistant" ? "new reply" : "new prompt"}
+                    </span>
+                    <span className="text-[10px] text-zinc-600 font-mono">{t.sessionId.slice(0, 6)}</span>
+                  </div>
+                  <div className="text-xs text-zinc-200 line-clamp-2 leading-tight">{t.preview}</div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Drag-to-Space hint when no spaces yet. Sits ABOVE the multi-select
+            toolbar so they don't overlap if both are active at once. */}
+        {dragSession && spaces.length === 0 && (
+          <div className={`absolute left-1/2 -translate-x-1/2 z-30 px-3 py-2 rounded bg-zinc-900/95 border border-zinc-700 text-xs text-zinc-300 ${multiSelected.size > 0 ? "bottom-14" : "bottom-3"}`}>
+            create a Space first to drop this session into one
+          </div>
+        )}
+
+        {/* Inline card expansion (cards mode only). The pinned card takes
+            priority over the live selection so you can keep one open while
+            navigating other cards. */}
+        {(() => {
+          if (nodeStyle !== "cards") return null;
+          const isPinned = pinnedCardId !== null && layout?.nodes.has(pinnedCardId);
+          const id = isPinned ? pinnedCardId : selected;
+          if (!id || !layout?.nodes.has(id)) return null;
+          return (
+            <InlineCardExpand
+              layout={layout}
+              selectedId={id}
+              selectedDetail={isPinned ? pinnedDetail : selectedDetail}
+              viewportWidth={size.w}
+              viewportHeight={size.h}
+              getTransform={() => transformRef.current}
+              pinned={!!isPinned}
+              onPin={() => {
+                setPinnedCardId(id);
+                setPinnedDetail(selectedDetail);
+              }}
+              onUnpin={() => {
+                setPinnedCardId(null);
+                setPinnedDetail(null);
+              }}
+              onClose={() => {
+                if (isPinned) { setPinnedCardId(null); setPinnedDetail(null); }
+                else setSelected(null);
+              }}
+            />
+          );
+        })()}
       </div>
 
-      {/* Side detail panel */}
-      {selected && (
+      {/* Side detail panel — hidden in cards mode where inline expansion replaces it */}
+      {selected && nodeStyle !== "cards" && (
         <div className="absolute top-0 right-0 bottom-0 w-[480px] border-l border-zinc-800 bg-zinc-950/95 backdrop-blur overflow-y-auto z-10">
           <DetailPanel
             data={selectedDetail}
@@ -1449,6 +2727,22 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             spaces={spaces}
             onAddToSpace={(sid, spId) => addSessionToSpace(sid, spId)}
             onRemoveFromSpace={(sid, spId) => removeSessionFromSpace(sid, spId)}
+            onNewCCSession={() => {
+              setSpawnModal({
+                mode: "new",
+                cwd: "",
+                prompt: "",
+                targetSpaceId: activeSpaceId,
+              });
+            }}
+            onContinueSession={(sid) => {
+              setSpawnModal({
+                mode: "continue",
+                sessionId: sid,
+                cwd: "",
+                prompt: "",
+              });
+            }}
             animateTo={animateTo}
             onZoomIn={() => {
               const t = transformRef.current;
@@ -1492,6 +2786,121 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
+      {/* Spawn-session modal (Phase 3c) — stays open as a chat for back-and-forth */}
+      {spawnModal && (() => {
+        // Live session transcript (only in continue mode) — read from forest
+        const sessionNodes = spawnModal.mode === "continue"
+          ? (forest.nodes ?? [])
+              .filter((n) => n.sessionId === spawnModal.sessionId)
+              .filter((n) => (n.role === "user" && n.subtype === "prompt") || (n.role === "assistant" && n.subtype === "text"))
+              .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+          : [];
+        return (
+          <div
+            className="absolute inset-0 z-40 bg-zinc-950/80 backdrop-blur flex items-center justify-center"
+            onClick={(e) => { if (e.target === e.currentTarget) setSpawnModal(null); }}
+          >
+            <div className="bg-zinc-900 border border-zinc-700 rounded-lg p-5 max-w-2xl w-full text-sm space-y-3 max-h-[85vh] flex flex-col">
+              <div className="flex items-center justify-between">
+                <div className="text-zinc-100 font-semibold text-base">
+                  {spawnModal.mode === "new" ? "✦ New Claude Code session" : "✦ Chat with session"}
+                </div>
+                <button
+                  onClick={() => setSpawnModal(null)}
+                  className="text-zinc-500 hover:text-zinc-200 text-base leading-none"
+                  title="close (esc)"
+                >
+                  ✕
+                </button>
+              </div>
+              {spawnModal.mode === "continue" && (
+                <div className="text-xs text-zinc-500 font-mono">
+                  resume: {spawnModal.sessionId.slice(0, 8)}… · {sessionNodes.length} message{sessionNodes.length === 1 ? "" : "s"}
+                </div>
+              )}
+
+              {/* Transcript scroll area (continue mode only) */}
+              {spawnModal.mode === "continue" && sessionNodes.length > 0 && (
+                <div className="flex-1 overflow-y-auto border border-zinc-800 rounded bg-zinc-950 p-2 space-y-2 min-h-0">
+                  {sessionNodes.map((n) => (
+                    <div key={n.id} className="text-xs">
+                      <div className={`text-[10px] font-mono mb-0.5 ${n.role === "assistant" ? "text-amber-400" : "text-emerald-400"}`}>
+                        {n.role === "assistant" ? "ASSISTANT" : "YOU"} · {new Date(n.timestamp).toLocaleTimeString()}
+                      </div>
+                      <div className="text-zinc-200 whitespace-pre-wrap leading-snug">{n.preview}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {spawnModal.mode === "new" && (
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">Working directory (optional)</label>
+                  <input
+                    type="text"
+                    value={spawnModal.cwd}
+                    onChange={(e) => setSpawnModal((m) => m ? { ...m, cwd: e.target.value } : m)}
+                    placeholder="C:\Users\bnakk\projects\… (default: your home dir)"
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1.5 text-zinc-100 text-xs font-mono"
+                  />
+                </div>
+              )}
+              <div>
+                <label className="block text-xs text-zinc-400 mb-1">
+                  {spawnModal.mode === "new" ? "Prompt" : "Reply"}
+                </label>
+                <textarea
+                  autoFocus
+                  value={spawnModal.prompt}
+                  onChange={(e) => setSpawnModal((m) => m ? { ...m, prompt: e.target.value } : m)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      void submitSpawn();
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      setSpawnModal(null);
+                    }
+                  }}
+                  rows={4}
+                  placeholder={spawnModal.mode === "new" ? "What do you want Claude to do?" : "Type your next message…"}
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1.5 text-zinc-100 text-sm"
+                />
+                <div className="text-[10px] text-zinc-500 mt-1">Ctrl/Cmd+Enter to send · Esc to close</div>
+              </div>
+              {spawnModal.mode === "new" && spawnModal.targetSpaceId && (() => {
+                const sp = spaces.find((p) => p.id === spawnModal.targetSpaceId);
+                return sp ? (
+                  <div className="text-xs text-zinc-400">
+                    Will be added to space: <span className="text-emerald-400">{sp.name}</span>
+                  </div>
+                ) : null;
+              })()}
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  onClick={() => setSpawnModal(null)}
+                  className="px-3 py-1 text-xs text-zinc-400 hover:text-zinc-200"
+                >
+                  Close
+                </button>
+                <button
+                  onClick={() => void submitSpawn()}
+                  disabled={!spawnModal.prompt.trim()}
+                  className="px-3 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 disabled:opacity-30 disabled:hover:bg-emerald-700 rounded text-white"
+                >
+                  {spawnModal.mode === "new" ? "Spawn session" : "Send"}
+                </button>
+              </div>
+              <div className="text-[10px] text-zinc-600 pt-2 border-t border-zinc-800">
+                {spawnModal.mode === "new"
+                  ? "After spawn this turns into a chat — keep typing replies; each one spawns claude --resume in the background."
+                  : "Replies stream into the transcript above as Claude writes. Map nodes update too."}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Help modal */}
       {helpOpen && (
         <div
@@ -1499,31 +2908,44 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           onClick={() => setHelpOpen(false)}
         >
           <div
-            className="bg-zinc-900 border border-zinc-700 rounded-lg p-6 max-w-md text-sm space-y-3"
+            className="bg-zinc-900 border border-zinc-700 rounded-lg p-6 max-w-2xl text-sm grid grid-cols-2 gap-x-8 gap-y-3 max-h-[85vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="text-zinc-100 font-semibold text-base mb-2">cc-map — tree-map controls</div>
-            <KbdGroup title="Navigation">
+            <div className="col-span-2 text-zinc-100 font-semibold text-base mb-1">cc-map — controls</div>
+            <KbdGroup title="Pan & zoom">
               <KbdRow keys={["drag"]} desc="pan" />
               <KbdRow keys={["2-finger scroll"]} desc="pan (trackpad)" />
               <KbdRow keys={["ctrl", "+", "wheel"]} desc="zoom (or pinch)" />
               <KbdRow keys={["="]} desc="zoom in" />
               <KbdRow keys={["−"]} desc="zoom out" />
+              <KbdRow keys={["double-click"]} desc="zoom in 2× at cursor" />
             </KbdGroup>
-            <KbdGroup title="View">
+            <KbdGroup title="Fit & jump">
               <KbdRow keys={["0", "f"]} desc="fit all" />
               <KbdRow keys={["1"]} desc="fit most recent session" />
-              <KbdRow keys={["double-click"]} desc="zoom in 2× at cursor" />
-              <KbdRow keys={["right-click"]} desc="context menu" />
+              <KbdRow keys={["space"]} desc="jump to live tip" />
+              <KbdRow keys={["click minimap"]} desc="pan to that area" />
+              <KbdRow keys={["click ★ gutter"]} desc="jump to bookmark" />
+              <KbdRow keys={["click live arrow"]} desc="pan to off-screen live tip" />
             </KbdGroup>
             <KbdGroup title="Selection">
+              <KbdRow keys={["click"]} desc="select node / zoom to session band" />
               <KbdRow keys={["↑", "↓"]} desc="prev/next node in session" />
               <KbdRow keys={["←", "→"]} desc="prev/next node in session" />
-              <KbdRow keys={["space"]} desc="jump to live tip (the message being written right now)" />
               <KbdRow keys={["b"]} desc="bookmark the selected node" />
+              <KbdRow keys={["esc"]} desc="close overlay / clear search" />
             </KbdGroup>
-            <KbdGroup title="CLI integration (right-click any node)">
-              <KbdRow keys={["right-click"]} desc="resume / fork / copy command for that session" />
+            <KbdGroup title="Search">
+              <KbdRow keys={["/"]} desc="open search" />
+              <KbdRow keys={["enter"]} desc="next match (shift+enter = prev)" />
+              <KbdRow keys={["↓", "↑"]} desc="(in search) next / prev match" />
+              <KbdRow keys={["ctrl", "+", "n"]} desc="(in search) next match" />
+              <KbdRow keys={["ctrl", "+", "p"]} desc="(in search) prev match" />
+            </KbdGroup>
+            <KbdGroup title="Spaces">
+              <KbdRow keys={["shift", "+", "drag node"]} desc="drag-to-Space chip in sidebar" />
+              <KbdRow keys={["click + N badge"]} desc="expand collapsed subagents" />
+              <KbdRow keys={["right-click"]} desc="context menu (resume / fork / add to space)" />
             </KbdGroup>
             <KbdGroup title="Chord shortcuts (press g, then…)">
               <KbdRow keys={["g", "v"]} desc="back to viewer" />
@@ -1532,23 +2954,225 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               <KbdRow keys={["g", "f"]} desc="fit all" />
               <KbdRow keys={["g", "l"]} desc="jump to live tip" />
             </KbdGroup>
-            <KbdGroup title="Search & navigation">
-              <KbdRow keys={["/"]} desc="search messages" />
-              <KbdRow keys={["enter"]} desc="(in search) fit to matches" />
-              <KbdRow keys={["esc"]} desc="close panel / search / back to viewer" />
+            <KbdGroup title="Modes (sidebar)">
+              <KbdRow keys={["grid"]} desc="square-ish tree-map; forks stack" />
+              <KbdRow keys={["column"]} desc="prompts down, replies right" />
+              <KbdRow keys={["timeline"]} desc="one column per session; Y = real time" />
+              <KbdRow keys={["dots / cards"]} desc="dot or text-card rendering" />
+              <KbdRow keys={["role / recency / cost"]} desc="color modes (heat-maps add legend)" />
+              <KbdRow keys={["follow live"]} desc="auto-recenter as new messages arrive" />
+            </KbdGroup>
+            <KbdGroup title="Help">
               <KbdRow keys={["?"]} desc="toggle this help" />
             </KbdGroup>
-            <div className="text-xs text-zinc-500 pt-3 border-t border-zinc-800">
-              Semantic zoom: at low zoom you see sessions as colored ribbons (one per session, color = project). Zoom in to see individual messages.
+            <div className="col-span-2 flex items-center justify-between pt-3 border-t border-zinc-800">
+              <div className="text-xs text-zinc-500 flex-1 pr-4">
+                Semantic zoom: low zoom shows sessions as colored ribbons. Zoom in to see individual messages.
+                In timeline mode, vertical gaps are real time (clamped so a week-long pause doesn't blow up the canvas).
+              </div>
+              <button
+                className="text-xs text-zinc-400 hover:text-zinc-200 underline shrink-0"
+                onClick={() => { setHelpOpen(false); setWelcomeOpen(true); }}
+              >
+                show intro
+              </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Command palette (Cmd/Ctrl+K) — jump to anything, switch any mode,
+          run any common action. Built fresh each render from current state. */}
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        items={paletteItems}
+      />
+
+      {/* Welcome modal — first-visit intro to what cc-map is and how to use it */}
+      {welcomeOpen && (
+        <div
+          className="absolute inset-0 z-50 bg-zinc-950/80 backdrop-blur flex items-center justify-center"
+          onClick={() => { setWelcomeOpen(false); try { localStorage.setItem("cc-map-seen-welcome", "1"); } catch {} }}
+        >
+          <div
+            className="bg-zinc-900 border border-zinc-700 rounded-lg p-6 max-w-lg space-y-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-zinc-100 font-semibold text-xl">Welcome to cc-map</div>
+            <p className="text-sm text-zinc-300 leading-relaxed">
+              A 2D map of every Claude Code session you've ever had. Each colored
+              ribbon is a session; zoom in to see individual prompts and replies.
+            </p>
+            <ul className="text-sm text-zinc-300 space-y-2 list-disc list-inside">
+              <li>
+                <span className="font-semibold text-emerald-300">live updates:</span>{" "}
+                new messages appear as soon as you send them — watch the pulsing
+                emerald tip
+              </li>
+              <li>
+                <span className="font-semibold text-amber-300">timeline mode:</span>{" "}
+                arranges sessions left-to-right by time, with Y = real elapsed
+                time inside each session
+              </li>
+              <li>
+                <span className="font-semibold text-cyan-300">spaces:</span>{" "}
+                curate sessions into named workspaces; shift+drag a node onto a
+                Space chip to add it
+              </li>
+              <li>
+                <span className="font-semibold text-violet-300">subagents:</span>{" "}
+                a "+N" badge means N subagent turns are hiding under that parent
+                — click to expand
+              </li>
+            </ul>
+            <div className="text-xs text-zinc-500 pt-2 border-t border-zinc-800">
+              Press <kbd className="px-1 rounded bg-zinc-800 border border-zinc-700">?</kbd> any time to see all keyboard shortcuts.
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                className="px-4 py-2 rounded bg-emerald-700 hover:bg-emerald-600 text-white text-sm"
+                onClick={() => { setWelcomeOpen(false); try { localStorage.setItem("cc-map-seen-welcome", "1"); } catch {} }}
+              >
+                Got it
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Drag-to-Space follower chip */}
+      {dragSession && (
+        <div
+          className="fixed z-50 pointer-events-none px-2 py-1 rounded bg-emerald-700 border border-emerald-400 text-xs text-white shadow-xl max-w-xs truncate"
+          style={{ left: dragSession.x + 12, top: dragSession.y + 12 }}
+        >
+          → {dragSession.label}
         </div>
       )}
     </div>
   );
 }
 
+// ───── Sidebar group helper ─────
+/**
+ * Collapsible sidebar section with persisted open state. The whole header is
+ * clickable; a chevron indicates state. Inner sections (e.g. "Layout" inside
+ * a "Display" group) keep their existing small sub-labels.
+ */
+function SidebarGroup({
+  id,
+  title,
+  defaultOpen = true,
+  count,
+  summary,
+  children,
+}: {
+  id: string;
+  title: string;
+  defaultOpen?: boolean;
+  count?: number | string;
+  /** One-line current-state summary shown right-aligned in the header when collapsed. */
+  summary?: string;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState<boolean>(() => {
+    try {
+      const raw = localStorage.getItem(`cc-map-sb-${id}`);
+      if (raw === "1") return true;
+      if (raw === "0") return false;
+    } catch {}
+    return defaultOpen;
+  });
+  useEffect(() => {
+    try { localStorage.setItem(`cc-map-sb-${id}`, open ? "1" : "0"); } catch {}
+  }, [open, id]);
+  return (
+    <div className="border-b border-zinc-800 pb-2">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200 text-[10px] uppercase tracking-wider font-semibold py-1.5"
+      >
+        <span className="text-zinc-600 w-3 text-xs">{open ? "▾" : "▸"}</span>
+        <span>{title}</span>
+        {count !== undefined && (
+          <span className="text-zinc-600 normal-case tracking-normal text-[10px]">({count})</span>
+        )}
+        {!open && summary && (
+          <span className="ml-auto text-zinc-500 normal-case tracking-normal text-[10px] truncate max-w-[140px]" title={summary}>
+            {summary}
+          </span>
+        )}
+      </button>
+      {open && <div className="space-y-2 mt-1">{children}</div>}
+    </div>
+  );
+}
+
 // ───── Helpers ─────
+
+/**
+ * Parse the URL hash into a partial state object. Supports a flat key=value
+ * format separated by `&`, e.g. `#m=per-project&d=timeline&n=cards`.
+ *
+ * Keys (short to keep URLs compact):
+ *   m  = ViewMode             (per-project | all-projects)
+ *   p  = project slug         (only with m=per-project)
+ *   d  = direction            (grid | column | timeline)
+ *   n  = nodeStyle            (dots | cards)
+ *   c  = colorMode            (role | recency | cost)
+ *   sp = active space id      ("" clears it)
+ *   s  = selected node uuid
+ */
+interface UrlState {
+  mode?: ViewMode;
+  scopeProject?: string | null;
+  direction?: LayoutDirection;
+  nodeStyle?: NodeStyle;
+  colorMode?: ColorMode;
+  activeSpaceId?: string | null;
+  selected?: string | null;
+}
+
+function parseUrlState(): UrlState {
+  if (typeof window === "undefined" || !window.location.hash) return {};
+  const out: UrlState = {};
+  const hash = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
+  for (const part of hash.split("&")) {
+    if (!part) continue;
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    const k = part.slice(0, eq);
+    const v = decodeURIComponent(part.slice(eq + 1));
+    switch (k) {
+      case "m": if (v === "per-project" || v === "all-projects") out.mode = v; break;
+      case "p": out.scopeProject = v || null; break;
+      case "d": if (v === "grid" || v === "column" || v === "timeline") out.direction = v; break;
+      case "n": if (v === "dots" || v === "cards") out.nodeStyle = v; break;
+      case "c": if (v === "role" || v === "recency" || v === "cost") out.colorMode = v; break;
+      case "sp": out.activeSpaceId = v || null; break;
+      case "s": out.selected = v || null; break;
+    }
+  }
+  return out;
+}
+
+function writeUrlState(s: UrlState): void {
+  if (typeof window === "undefined") return;
+  const parts: string[] = [];
+  if (s.mode && s.mode !== "per-project") parts.push(`m=${s.mode}`);
+  if (s.scopeProject) parts.push(`p=${encodeURIComponent(s.scopeProject)}`);
+  if (s.direction && s.direction !== "grid") parts.push(`d=${s.direction}`);
+  if (s.nodeStyle && s.nodeStyle !== "dots") parts.push(`n=${s.nodeStyle}`);
+  if (s.colorMode && s.colorMode !== "role") parts.push(`c=${s.colorMode}`);
+  if (s.activeSpaceId) parts.push(`sp=${encodeURIComponent(s.activeSpaceId)}`);
+  if (s.selected) parts.push(`s=${encodeURIComponent(s.selected)}`);
+  const next = parts.length > 0 ? `#${parts.join("&")}` : window.location.pathname + window.location.search;
+  // replaceState keeps history clean — state changes shouldn't spam back-button
+  if (window.location.hash !== (parts.length > 0 ? `#${parts.join("&")}` : "")) {
+    window.history.replaceState(null, "", next);
+  }
+}
 
 function easeOutCubic(t: number): number {
   return 1 - Math.pow(1 - t, 3);
@@ -1608,6 +3232,337 @@ function ZoomOverlay({
       <button className="px-2 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700" onClick={onFitAll} title="0 / f">all</button>
     </div>
   );
+}
+
+// ───── Inline card expansion (cards mode) ─────
+// Floating panel pinned to the selected card's screen position. Reads the
+// transform via RAF poll so it tracks pan/zoom. Click anywhere outside (or X)
+// to dismiss.
+// ───── Color legend ─────
+// A small bottom-left overlay shown when colorMode is "recency" or "cost".
+// Without it, the heat-map gradients are mystery colors. Reuses the same
+// gradient math the renderer uses (via buildColorContext) so what you see in
+// the legend matches what's on the map.
+function ColorLegend({ mode, layout }: { mode: "recency" | "cost"; layout: Layout }) {
+  const cc = useMemo(() => buildColorContext(layout.nodes.values()), [layout]);
+  if (mode === "recency") {
+    if (cc.tsMax <= cc.tsMin) return null;
+    return (
+      <div className="absolute bottom-3 left-8 z-20 px-2.5 py-2 bg-zinc-900/90 border border-zinc-700 rounded text-xs text-zinc-300 backdrop-blur shadow-xl">
+        <div className="text-[10px] text-zinc-500 uppercase tracking-wide mb-1">Recency</div>
+        <div
+          className="w-40 h-2 rounded"
+          style={{
+            background: "linear-gradient(to right, hsl(240,6%,35%), hsl(160,84%,55%))",
+          }}
+        />
+        <div className="flex justify-between mt-1 text-[10px] text-zinc-400 tabular-nums">
+          <span>{formatTimeAgo(cc.tsMin)}</span>
+          <span>{formatTimeAgo(cc.tsMax)}</span>
+        </div>
+      </div>
+    );
+  }
+  // cost
+  if (cc.costMax <= 1) return null;
+  return (
+    <div className="absolute bottom-3 left-3 z-20 px-2.5 py-2 bg-zinc-900/90 border border-zinc-700 rounded text-xs text-zinc-300 backdrop-blur shadow-xl">
+      <div className="text-[10px] text-zinc-500 uppercase tracking-wide mb-1">Output tokens</div>
+      <div
+        className="w-40 h-2 rounded"
+        style={{
+          background: "linear-gradient(to right, hsl(240,6%,35%), hsl(38,92%,55%), hsl(0,84%,55%))",
+        }}
+      />
+      <div className="flex justify-between mt-1 text-[10px] text-zinc-400 tabular-nums">
+        <span>0</span>
+        <span>{formatTokens(Math.round(cc.costMax / 0.66))}+</span>
+      </div>
+    </div>
+  );
+}
+
+function formatTimeAgo(ms: number): string {
+  const now = Date.now();
+  const diff = now - ms;
+  if (diff < 60_000) return "now";
+  const m = Math.round(diff / 60_000);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(diff / 3600_000);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.round(diff / 86400_000);
+  return `${d}d ago`;
+}
+
+/**
+ * Sidebar mini-heatmap: 5 weeks × 7 weekdays of prompts-per-day, like a
+ * tiny GitHub contribution graph. Click a cell → narrow the date filter to
+ * that day. Today is the rightmost column of the bottom row.
+ */
+function DailyActivityHeatmap({
+  forest,
+  filter,
+  onPickDate,
+}: {
+  forest: ForestPayload;
+  filter: SessionFilter;
+  onPickDate: (iso: string) => void;
+}) {
+  const ROWS = 5;
+  const COLS = 7;
+  const TOTAL = ROWS * COLS;
+
+  const { cells, max } = useMemo(() => {
+    // Count user prompts per day (yyyy-mm-dd in local time)
+    const counts = new Map<string, number>();
+    for (const n of forest.nodes) {
+      if (n.role !== "user" || n.subtype !== "prompt") continue;
+      const d = new Date(n.timestamp);
+      if (Number.isNaN(d.getTime())) continue;
+      const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      counts.set(iso, (counts.get(iso) ?? 0) + 1);
+    }
+    // Build grid: bottom-right = today; walk backward TOTAL-1 days.
+    const arr: { iso: string; date: Date; count: number }[] = [];
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    for (let i = TOTAL - 1; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      arr.push({ iso, date: d, count: counts.get(iso) ?? 0 });
+    }
+    let max = 0;
+    for (const c of arr) if (c.count > max) max = c.count;
+    return { cells: arr, max };
+  }, [forest]);
+
+  const intensity = (count: number): string => {
+    if (count === 0) return "rgba(63, 63, 70, 0.5)"; // zinc-700
+    const ratio = max > 0 ? count / max : 0;
+    if (ratio < 0.25) return "hsl(160, 50%, 28%)";
+    if (ratio < 0.5) return "hsl(160, 60%, 38%)";
+    if (ratio < 0.75) return "hsl(160, 72%, 48%)";
+    return "hsl(160, 84%, 55%)";
+  };
+
+  const monthsInRange = useMemo(() => {
+    const seen = new Set<string>();
+    for (const c of cells) seen.add(c.date.toLocaleString(undefined, { month: "short" }));
+    return [...seen];
+  }, [cells]);
+
+  return (
+    <div className="space-y-1">
+      <div
+        className="grid gap-[3px]"
+        style={{ gridTemplateColumns: `repeat(${COLS}, 1fr)` }}
+      >
+        {cells.map((c) => {
+          const isSelected = filter.startDate === c.iso && filter.endDate === c.iso;
+          return (
+            <button
+              key={c.iso}
+              onClick={() => onPickDate(c.iso)}
+              title={`${c.date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })} · ${c.count} prompt${c.count === 1 ? "" : "s"}`}
+              className={`aspect-square rounded-[2px] transition-transform hover:scale-125 ${isSelected ? "ring-1 ring-white" : ""}`}
+              style={{ background: intensity(c.count) }}
+            />
+          );
+        })}
+      </div>
+      <div className="flex justify-between text-[9px] text-zinc-500 px-0.5">
+        <span>{monthsInRange[0] ?? ""}</span>
+        <span>{max > 0 ? `max ${max}` : ""}</span>
+        <span>today</span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Wrap occurrences of `query` (case-insensitive, literal substring) in <mark>
+ * tags so the tooltip can show why a node matched the search. Returns the
+ * original text unchanged if query is empty.
+ */
+function highlightMatches(text: string, query: string): React.ReactNode {
+  const q = query.trim();
+  if (!q || !text) return text;
+  const lower = text.toLowerCase();
+  const needle = q.toLowerCase();
+  const out: React.ReactNode[] = [];
+  let i = 0;
+  let key = 0;
+  while (i < text.length) {
+    const found = lower.indexOf(needle, i);
+    if (found < 0) {
+      out.push(text.slice(i));
+      break;
+    }
+    if (found > i) out.push(text.slice(i, found));
+    out.push(
+      <mark
+        key={key++}
+        className="bg-amber-500/40 text-amber-100 rounded px-0.5"
+      >
+        {text.slice(found, found + needle.length)}
+      </mark>,
+    );
+    i = found + needle.length;
+  }
+  return out;
+}
+
+function humanGap(ms: number): string {
+  const m = Math.round(ms / 60_000);
+  if (m < 60) return `${m}m`;
+  const h = Math.round(ms / 3600_000);
+  if (h < 24) return `${h}h`;
+  return `${Math.round(ms / 86400_000)}d`;
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+function InlineCardExpand({
+  layout,
+  selectedId,
+  selectedDetail,
+  viewportWidth,
+  viewportHeight,
+  getTransform,
+  pinned,
+  onPin,
+  onUnpin,
+  onClose,
+}: {
+  layout: Layout;
+  selectedId: string;
+  selectedDetail: NodeResponse | null;
+  viewportWidth: number;
+  viewportHeight: number;
+  getTransform: () => Transform;
+  pinned: boolean;
+  onPin: () => void;
+  onUnpin: () => void;
+  onClose: () => void;
+}) {
+  const [pos, setPos] = useState<{ left: number; top: number; placement: "right" | "left" | "below" }>(
+    { left: 0, top: 0, placement: "right" },
+  );
+  const PANEL_W = 480;
+  const MAX_H = Math.min(560, viewportHeight - 40);
+
+  useEffect(() => {
+    let raf = 0;
+    const tick = () => {
+      const node = layout.nodes.get(selectedId);
+      if (node) {
+        const t = getTransform();
+        // Card top-left in screen coords. cardWidth = 260 layout units.
+        const sx = node.x * t.scale + t.tx;
+        const sy = node.y * t.scale + t.ty;
+        const cardScreenW = 260 * t.scale;
+        const cardScreenH = (node.cardHeight ?? 40) * t.scale;
+        // Prefer placing right of the card; fall back to left then below.
+        let left = sx + cardScreenW + 12;
+        let top = sy;
+        let placement: "right" | "left" | "below" = "right";
+        if (left + PANEL_W > viewportWidth - 12) {
+          // Try left
+          left = sx - PANEL_W - 12;
+          placement = "left";
+          if (left < 12) {
+            // Below the card
+            left = Math.max(12, Math.min(sx, viewportWidth - PANEL_W - 12));
+            top = sy + cardScreenH + 12;
+            placement = "below";
+          }
+        }
+        // Clamp top into viewport so panel is always reachable
+        top = Math.max(12, Math.min(top, viewportHeight - MAX_H - 12));
+        setPos((prev) =>
+          prev.left === left && prev.top === top && prev.placement === placement ? prev : { left, top, placement },
+        );
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [layout, selectedId, viewportWidth, viewportHeight, getTransform, MAX_H]);
+
+  // Esc to close
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const node = layout.nodes.get(selectedId);
+  if (!node) return null;
+
+  return (
+    <div
+      className="absolute z-30 bg-zinc-950/95 backdrop-blur border border-zinc-700 rounded-lg shadow-2xl overflow-hidden flex flex-col"
+      style={{ left: pos.left, top: pos.top, width: PANEL_W, maxHeight: MAX_H }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800 bg-zinc-900/60">
+        <div className="text-xs font-mono text-zinc-400 flex items-center gap-2">
+          <span className="uppercase font-semibold" style={{ color: roleColor(node.role, node.subtype) }}>
+            {headerLabel(node.role, node.subtype)}
+          </span>
+          <span className="text-zinc-600">·</span>
+          <span className="text-zinc-500">{selectedId.slice(0, 8)}</span>
+          {node.isSidechain && <span className="text-purple-400 text-[10px]">SUBAGENT</span>}
+          {pinned && <span className="text-amber-400 text-[10px]">PINNED</span>}
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={pinned ? onUnpin : onPin}
+            className={`w-6 h-6 rounded text-base leading-none ${pinned ? "text-amber-400 hover:text-amber-200 hover:bg-zinc-800" : "text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800"}`}
+            title={pinned ? "Unpin (let selection update this panel)" : "Pin this card open"}
+          >
+            {pinned ? "📌" : "📍"}
+          </button>
+          <button
+            onClick={onClose}
+            className="w-6 h-6 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 text-lg leading-none"
+            title="Close (Esc)"
+          >
+            ×
+          </button>
+        </div>
+      </div>
+      <div className="overflow-y-auto p-3 text-sm flex-1">
+        {selectedDetail ? (
+          <Suspense fallback={<div className="text-zinc-500 italic">loading renderer…</div>}>
+            <ContentRender data={selectedDetail} />
+          </Suspense>
+        ) : (
+          <div className="text-zinc-500 italic">loading…</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function headerLabel(role: "user" | "assistant", subtype: string | null): string {
+  if (role === "user" && subtype === "prompt") return "prompt";
+  if (role === "assistant" && subtype === "tool-only") return "tool call";
+  if (role === "assistant" && subtype === "thinking") return "thinking";
+  if (role === "assistant") return "assistant";
+  return subtype ?? "user";
+}
+
+function roleColor(role: "user" | "assistant", subtype: string | null): string {
+  if (role === "user" && subtype === "prompt") return "#34d399";
+  if (role === "assistant" && subtype === "tool-only") return "#60a5fa";
+  if (role === "assistant" && subtype === "thinking") return "#c084fc";
+  if (role === "assistant") return "#fbbf24";
+  return "#a1a1aa";
 }
 
 // ───── Detail panel ─────
@@ -1692,63 +3647,16 @@ function DetailPanel({
         </div>
       )}
       <div className="p-3 text-sm">
-        {data ? <ContentRender data={data} /> : <div className="text-zinc-500">loading…</div>}
+        {data ? (
+          <Suspense fallback={<div className="text-zinc-500 italic">loading renderer…</div>}>
+            <ContentRender data={data} />
+          </Suspense>
+        ) : (
+          <div className="text-zinc-500">loading…</div>
+        )}
       </div>
     </div>
   );
-}
-
-function ContentRender({ data }: { data: NodeResponse }) {
-  const raw = data.raw as { message?: { content?: unknown } } | null;
-  const content = raw?.message?.content;
-  if (typeof content === "string") {
-    return (
-      <div className="md-body text-zinc-200">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{content}</ReactMarkdown>
-      </div>
-    );
-  }
-  if (Array.isArray(content)) {
-    return (
-      <div className="space-y-2 text-zinc-200">
-        {content.map((block, i) => <BlockRender key={i} block={block} />)}
-      </div>
-    );
-  }
-  return <div className="text-zinc-500 italic">(empty)</div>;
-}
-
-function BlockRender({ block }: { block: unknown }) {
-  if (!block || typeof block !== "object") {
-    return <pre className="text-xs text-zinc-500">{JSON.stringify(block, null, 2)}</pre>;
-  }
-  const b = block as { type?: string; text?: string; name?: string; input?: unknown; content?: unknown };
-  if (b.type === "text" && typeof b.text === "string") {
-    return <div className="md-body"><ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{b.text}</ReactMarkdown></div>;
-  }
-  if (b.type === "tool_use") {
-    return (
-      <details className="border border-blue-900/50 bg-blue-950/20 rounded p-2 text-xs">
-        <summary className="cursor-pointer text-blue-400 font-mono">🔧 {b.name ?? "tool"}</summary>
-        <pre className="mt-2 overflow-x-auto text-blue-200">{JSON.stringify(b.input, null, 2)}</pre>
-      </details>
-    );
-  }
-  if (b.type === "tool_result") {
-    const text =
-      typeof b.content === "string"
-        ? b.content
-        : Array.isArray(b.content)
-          ? b.content.map((c) => (c && typeof c === "object" && "text" in c ? String((c as { text: unknown }).text) : "")).join("\n")
-          : "";
-    return (
-      <details className="border border-zinc-800 bg-zinc-900/40 rounded p-2 text-xs">
-        <summary className="cursor-pointer text-zinc-400 font-mono">📨 tool_result</summary>
-        <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-zinc-300">{text}</pre>
-      </details>
-    );
-  }
-  return <pre className="text-xs text-zinc-500">{JSON.stringify(block, null, 2)}</pre>;
 }
 
 // ───── Help modal subcomponents ─────
@@ -1787,6 +3695,8 @@ function ContextMenuItems({
   spaces,
   onAddToSpace,
   onRemoveFromSpace,
+  onNewCCSession,
+  onContinueSession,
   animateTo,
   onZoomIn,
   onZoomOut,
@@ -1805,6 +3715,8 @@ function ContextMenuItems({
   spaces: Space[];
   onAddToSpace: (sessionId: string, spaceId: string) => void;
   onRemoveFromSpace: (sessionId: string, spaceId: string) => void;
+  onNewCCSession: () => void;
+  onContinueSession: (sessionId: string) => void;
   animateTo: (to: Transform, ms?: number) => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
@@ -1871,6 +3783,10 @@ function ContextMenuItems({
         <>
           <MenuDivider />
           <MenuItem
+            label="✦ Continue this session (in map)"
+            onClick={() => { onContinueSession(sessionId); onClose(); }}
+          />
+          <MenuItem
             label="Resume session in new terminal"
             onClick={() => { onResumeCLI(sessionId, false); onClose(); }}
           />
@@ -1921,6 +3837,8 @@ function ContextMenuItems({
       )}
       {target.kind === "empty" && (
         <>
+          <MenuItem label="✦ New Claude Code session" onClick={() => { onNewCCSession(); onClose(); }} />
+          <MenuDivider />
           <MenuItem label="Zoom in here" onClick={() => { onZoomIn(); onClose(); }} />
           <MenuItem label="Zoom out" onClick={() => { onZoomOut(); onClose(); }} />
           <MenuDivider />

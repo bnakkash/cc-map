@@ -261,6 +261,70 @@ fastify.post<{
   }
 });
 
+/**
+ * POST /api/spawn-session — kick off a brand new Claude Code session from the map.
+ * Body: { prompt, cwd, sessionId? } — server pre-generates sessionId if missing,
+ * spawns `claude --print --session-id <uuid> --add-dir <cwd>` (which writes the
+ * JSONL file the watcher then ingests in real time). Fire-and-forget — the
+ * watcher reports completion via SSE deltas as `claude` writes.
+ */
+fastify.post<{
+  Body: { prompt?: unknown; cwd?: unknown; sessionId?: unknown };
+}>("/api/spawn-session", async (req, reply) => {
+  const { prompt, cwd, sessionId: requestedSid } = req.body ?? {};
+  if (typeof prompt !== "string" || prompt.trim().length === 0) {
+    return reply.code(400).send({ error: "prompt required" });
+  }
+  const sid = typeof requestedSid === "string" && SESSION_ID_RE.test(requestedSid)
+    ? requestedSid
+    : (await import("node:crypto")).randomUUID();
+  const safeCwd = typeof cwd === "string" && cwd.length > 0 ? cwd : process.env.HOME ?? process.env.USERPROFILE ?? process.cwd();
+  try {
+    const { spawn } = await import("node:child_process");
+    const child = spawn("claude", ["--print", "--session-id", sid, prompt], {
+      cwd: safeCwd,
+      detached: true,
+      stdio: "ignore",
+      shell: false,
+    });
+    child.unref();
+    return { ok: true, sessionId: sid, cwd: safeCwd };
+  } catch (err) {
+    return reply.code(500).send({ error: String(err) });
+  }
+});
+
+/**
+ * POST /api/continue-session — append a new turn to an existing CC session by
+ * spawning `claude --resume <sessionId> --print "<prompt>"`. Watcher reports
+ * new nodes via SSE delta.
+ */
+fastify.post<{
+  Body: { sessionId?: unknown; prompt?: unknown; cwd?: unknown };
+}>("/api/continue-session", async (req, reply) => {
+  const { sessionId, prompt, cwd } = req.body ?? {};
+  if (typeof sessionId !== "string" || !SESSION_ID_RE.test(sessionId)) {
+    return reply.code(400).send({ error: "invalid sessionId" });
+  }
+  if (typeof prompt !== "string" || prompt.trim().length === 0) {
+    return reply.code(400).send({ error: "prompt required" });
+  }
+  const safeCwd = typeof cwd === "string" && cwd.length > 0 ? cwd : undefined;
+  try {
+    const { spawn } = await import("node:child_process");
+    const child = spawn("claude", ["--resume", sessionId, "--print", prompt], {
+      ...(safeCwd ? { cwd: safeCwd } : {}),
+      detached: true,
+      stdio: "ignore",
+      shell: false,
+    });
+    child.unref();
+    return { ok: true, sessionId };
+  } catch (err) {
+    return reply.code(500).send({ error: String(err) });
+  }
+});
+
 fastify.post<{
   Body: { sessionId?: unknown; cwd?: unknown; source?: unknown };
 }>("/api/hook/session-start", async (req, reply) => {

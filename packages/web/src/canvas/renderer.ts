@@ -3,10 +3,14 @@ import {
   EDGE_FORK_COLOR,
   NODE_RING_FORK,
   NODE_RING_SELECTED,
+  buildColorContext,
+  colorForNode,
   nodeColor,
   projectColor,
+  type ColorContext,
 } from "./colors.js";
-import { LAYOUT, type Layout, type NodeStyle, type SessionBand, type ViewMode } from "./types.js";
+import { LAYOUT, type ColorMode, type Layout, type LayoutNode, type NodeStyle, type SessionBand, type ViewMode } from "./types.js";
+import { timelineNowY } from "./layout.js";
 
 // Draw dashed sequence links between same-session disconnected roots.
 function drawSequenceLinks(
@@ -65,6 +69,14 @@ export interface RenderState {
   nowMs: number;
   /** Render each node as a text card instead of a dot. */
   nodeStyle: NodeStyle;
+  /** How nodes are colored — role, recency heat-map, or cost heat-map. */
+  colorMode: ColorMode;
+  /** When true, subagent nodes are hidden — and we draw a "+N subagents"
+   *  badge on each parent that would expand into one. */
+  subagentsCollapsed: boolean;
+  /** Set of node ids currently in the multi-select set (ctrl/cmd+click).
+   *  Drawn with a cyan outline distinct from hover/select. */
+  multiSelectedIds: Set<string> | null;
 }
 
 /**
@@ -139,13 +151,32 @@ export function render(
     }
   }
 
+  // Color context for heat-map modes (cheap to build per-frame; nodes is a Map)
+  const colorCtx = buildColorContext(layout.nodes.values());
+
   // ───── Render the appropriate LOD ─────
   if (lod === "overview") {
     renderOverview(ctx, layout, state, view);
   } else if (lod === "session") {
-    renderSession(ctx, layout, state, view);
+    renderSession(ctx, layout, state, view, colorCtx);
   } else {
-    renderDetail(ctx, layout, state, view);
+    renderDetail(ctx, layout, state, view, colorCtx);
+  }
+
+  // ───── Off-screen live-tip indicator (screen-space, drawn while world transform is active) ─────
+  // Computed inside the transformed pass so we can still reference layout coords,
+  // but the arrow itself is drawn after restore() below.
+  let offscreenLiveScreen: { sx: number; sy: number } | null = null;
+  if (state.liveTipId) {
+    const tip = layout.nodes.get(state.liveTipId);
+    if (tip) {
+      const sx = tip.x * transform.scale + transform.tx;
+      const sy = tip.y * transform.scale + transform.ty;
+      const margin = 24;
+      if (sx < margin || sx > viewportWidth - margin || sy < margin || sy > viewportHeight - margin) {
+        offscreenLiveScreen = { sx, sy };
+      }
+    }
   }
 
   // ───── Project labels (in all-projects mode) ─────
@@ -167,6 +198,203 @@ export function render(
     }
   }
 
+  // ───── Timeline now-line for the active session ─────
+  // Drawn inside the world transform so coordinates line up with nodes;
+  // pulses emerald to read as "you are here, now."
+  if (state.activeSessionId && layout.timelineAnchors) {
+    const anchor = layout.timelineAnchors.get(state.activeSessionId);
+    if (anchor) {
+      const nowY = timelineNowY(anchor, state.nowMs);
+      // Only draw if it's vertically inside (or just past) the viewport
+      if (nowY > view.y0 && nowY < view.y1) {
+        const pulse = 0.5 + 0.5 * Math.sin(state.nowMs / 350);
+        ctx.strokeStyle = `rgba(52, 211, 153, ${0.5 + 0.4 * pulse})`;
+        ctx.lineWidth = Math.max(1, 1.5 / transform.scale);
+        ctx.setLineDash([6 / transform.scale, 4 / transform.scale]);
+        ctx.beginPath();
+        ctx.moveTo(anchor.x - 8 / transform.scale, nowY);
+        ctx.lineTo(anchor.xRight + 8 / transform.scale, nowY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // Tiny "now" pill on the right edge
+        const labelFont = 10 / transform.scale;
+        ctx.font = `bold ${labelFont}px ui-sans-serif, system-ui, sans-serif`;
+        ctx.textBaseline = "middle";
+        ctx.textAlign = "left";
+        const labelText = "NOW";
+        const lpad = 4 / transform.scale;
+        const lw = ctx.measureText(labelText).width + lpad * 2;
+        const lh = labelFont + 4 / transform.scale;
+        ctx.fillStyle = `rgba(52, 211, 153, ${0.7 + 0.3 * pulse})`;
+        roundRect(ctx, anchor.xRight + 4 / transform.scale, nowY - lh / 2, lw, lh, lh / 2);
+        ctx.fill();
+        ctx.fillStyle = "#06251a";
+        ctx.fillText(labelText, anchor.xRight + 4 / transform.scale + lpad, nowY);
+      }
+    }
+  }
+
+  ctx.restore();
+
+  // ───── Sticky session labels (screen-space) ─────
+  // When you pan deep into a tall session, its label scrolled off the top edge,
+  // so you lose context for "what session am I in." Pin the label to the
+  // viewport top whenever the band's top is above the viewport but the band
+  // is still partially visible. Only fires at session/detail LOD where
+  // individual session orientation matters.
+  if (lod !== "overview") {
+    drawStickySessionLabels(ctx, layout, transform, state, viewportWidth, viewportHeight, dpr);
+  }
+
+  // ───── Screen-space overlay: off-screen live-tip arrow ─────
+  // Drawn after restore so its size is in CSS pixels regardless of zoom.
+  // Pulses emerald like the on-canvas live tip; points toward the live message
+  // when it's outside the viewport, with a short label "live →".
+  if (offscreenLiveScreen) {
+    drawOffscreenLiveArrow(ctx, offscreenLiveScreen, state.nowMs, viewportWidth, viewportHeight, dpr);
+  }
+}
+
+/**
+ * Where the off-screen live arrow lands on the viewport edge — used by hit-testing
+ * in TreeMap.tsx so clicking it pans-to-live. Returns null if the live tip is on-screen
+ * or there's no live tip. Keep this in sync with drawOffscreenLiveArrow's math.
+ */
+export function getOffscreenLiveArrowBox(
+  layout: Layout,
+  transform: Transform,
+  liveTipId: string | null,
+  viewportWidth: number,
+  viewportHeight: number,
+): { x: number; y: number; w: number; h: number } | null {
+  if (!liveTipId) return null;
+  const tip = layout.nodes.get(liveTipId);
+  if (!tip) return null;
+  const sx = tip.x * transform.scale + transform.tx;
+  const sy = tip.y * transform.scale + transform.ty;
+  const margin = 24;
+  if (sx >= margin && sx <= viewportWidth - margin && sy >= margin && sy <= viewportHeight - margin) {
+    return null;
+  }
+  const { ex, ey } = clampToEdge(sx, sy, viewportWidth, viewportHeight, 36);
+  const size = 44;
+  return { x: ex - size / 2, y: ey - size / 2, w: size, h: size };
+}
+
+/**
+ * Hit-test the subagent "+N" badges in screen coordinates. Returns the parent
+ * uuid whose badge was clicked, or null. Mirrors drawSubagentBadges' layout
+ * math so click targets match what the user sees.
+ */
+export function getSubagentBadgeAt(
+  layout: Layout,
+  transform: Transform,
+  subagentsCollapsed: boolean,
+  nodeStyle: NodeStyle,
+  screenX: number,
+  screenY: number,
+): string | null {
+  if (!subagentsCollapsed) return null;
+  if (layout.subagentCountByParent.size === 0) return null;
+  const cardMode = nodeStyle === "cards";
+  // Replicate font setup in a measurement-only canvas via a transient ctx is
+  // expensive; use a conservative width estimate per digit instead.
+  // Approximation: ~6.5 screen px per char for the 9px bold font.
+  const PER_CHAR_PX = 6.5;
+  const hPx = cardMode ? 14 : 14;
+  for (const [parentId, count] of layout.subagentCountByParent) {
+    const n = layout.nodes.get(parentId);
+    if (!n) continue;
+    const sx = n.x * transform.scale + transform.tx;
+    const sy = n.y * transform.scale + transform.ty;
+    const text = `+${count}`;
+    const wPx = text.length * PER_CHAR_PX + 8;
+    let bx: number;
+    let by: number;
+    if (cardMode) {
+      // Top-right corner of the card
+      bx = sx + LAYOUT.cardWidth * transform.scale - wPx - 4;
+      by = sy + 4;
+    } else {
+      // Right of the dot
+      const rPx = Math.max(LAYOUT.nodeRadius, 2.5 / transform.scale) * transform.scale + 4;
+      bx = sx + rPx;
+      by = sy - hPx / 2;
+    }
+    if (screenX >= bx && screenX <= bx + wPx && screenY >= by && screenY <= by + hPx) {
+      return parentId;
+    }
+  }
+  return null;
+}
+
+function clampToEdge(
+  sx: number,
+  sy: number,
+  vw: number,
+  vh: number,
+  pad: number,
+): { ex: number; ey: number } {
+  const cx = vw / 2;
+  const cy = vh / 2;
+  const dx = sx - cx;
+  const dy = sy - cy;
+  if (dx === 0 && dy === 0) return { ex: cx, ey: cy };
+  // Scale (dx, dy) so it lands on the inner rect (vw-2*pad × vh-2*pad)
+  const tx = dx === 0 ? Infinity : (vw / 2 - pad) / Math.abs(dx);
+  const ty = dy === 0 ? Infinity : (vh / 2 - pad) / Math.abs(dy);
+  const t = Math.min(tx, ty);
+  return { ex: cx + dx * t, ey: cy + dy * t };
+}
+
+function drawOffscreenLiveArrow(
+  ctx: CanvasRenderingContext2D,
+  tipScreen: { sx: number; sy: number },
+  nowMs: number,
+  viewportWidth: number,
+  viewportHeight: number,
+  dpr: number,
+): void {
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { ex, ey } = clampToEdge(tipScreen.sx, tipScreen.sy, viewportWidth, viewportHeight, 36);
+  const angle = Math.atan2(tipScreen.sy - viewportHeight / 2, tipScreen.sx - viewportWidth / 2);
+  const pulse = 0.5 + 0.5 * Math.sin(nowMs / 280);
+  const alpha = 0.7 + 0.3 * pulse;
+
+  // Outer ring (interactive target zone)
+  ctx.fillStyle = `rgba(9, 9, 11, 0.85)`;
+  ctx.strokeStyle = `rgba(52, 211, 153, ${alpha})`;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(ex, ey, 22, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // Inner arrow pointing toward live tip
+  ctx.translate(ex, ey);
+  ctx.rotate(angle);
+  ctx.fillStyle = `#34d399`;
+  ctx.beginPath();
+  ctx.moveTo(10, 0);
+  ctx.lineTo(-4, -7);
+  ctx.lineTo(-4, 7);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  // "live" label below/beside
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#34d399";
+  // Place label inside the viewport: nudge toward center if at an edge
+  const labelOffset = 32;
+  const lx = ex + (viewportWidth / 2 - ex) * 0.07;
+  const ly = ey + (viewportHeight / 2 - ey) * 0.07 + (ey < viewportHeight / 2 ? labelOffset : -labelOffset);
+  ctx.fillText("LIVE", lx, ly);
   ctx.restore();
 }
 
@@ -217,6 +445,7 @@ function renderSession(
   layout: Layout,
   state: RenderState,
   view: { x0: number; y0: number; x1: number; y1: number },
+  colorCtx: ColorContext,
 ): void {
   const scale = state.transform.scale;
   // Session bands with lower opacity (a backdrop for the density rendering)
@@ -241,11 +470,12 @@ function renderSession(
     if (n.x + r < view.x0 || n.x - r > view.x1) continue;
     if (n.y + r < view.y0 || n.y - r > view.y1) continue;
     const isHi = state.highlightedNodeIds?.has(n.id);
-    ctx.fillStyle = isHi ? "#ffffff" : nodeColor(n.role, n.subtype, n.isSidechain);
+    ctx.fillStyle = isHi ? "#ffffff" : colorForNode(n, state.colorMode, colorCtx);
     ctx.beginPath();
     ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
     ctx.fill();
   }
+  drawSessionSparklines(ctx, layout, state, view);
   drawSessionLabels(ctx, layout, state, view, /*minBandPx=*/ 18);
   drawSelectionAndHover(ctx, layout, state);
   drawLiveTip(ctx, layout, state);
@@ -256,11 +486,12 @@ function renderDetail(
   layout: Layout,
   state: RenderState,
   view: { x0: number; y0: number; x1: number; y1: number },
+  colorCtx: ColorContext,
 ): void {
   const scale = state.transform.scale;
   // Card mode dispatches to a completely different render
   if (state.nodeStyle === "cards") {
-    renderCards(ctx, layout, state, view);
+    renderCards(ctx, layout, state, view, colorCtx);
     return;
   }
   // Faint session backgrounds for visual grouping; active session gets a brighter tint
@@ -295,7 +526,7 @@ function renderDetail(
     if (n.x + r < view.x0 || n.x - r > view.x1) continue;
     if (n.y + r < view.y0 || n.y - r > view.y1) continue;
     const isHi = state.highlightedNodeIds?.has(n.id);
-    let color = nodeColor(n.role, n.subtype, n.isSidechain);
+    let color = colorForNode(n, state.colorMode, colorCtx);
     ctx.globalAlpha = nodeAlpha(n.role, n.subtype);
     ctx.fillStyle = isHi ? "#fafafa" : color;
     ctx.beginPath();
@@ -317,6 +548,10 @@ function renderDetail(
       ctx.stroke();
     }
   }
+  drawSessionSparklines(ctx, layout, state, view);
+  if (state.subagentsCollapsed) drawSubagentBadges(ctx, layout, state, view, /*cardMode=*/ false);
+  drawTimelineGapLabels(ctx, layout, state, view, /*cardMode=*/ false);
+  drawMultiSelect(ctx, layout, state, /*cardMode=*/ false);
   drawSessionLabels(ctx, layout, state, view, /*minBandPx=*/ 12);
   // Inline node text labels (only when zoomed in enough — and capped to avoid clutter)
   if (scale >= 1.5) {
@@ -451,16 +686,21 @@ function renderCards(
   layout: Layout,
   state: RenderState,
   view: { x0: number; y0: number; x1: number; y1: number },
+  colorCtx: ColorContext,
 ): void {
   const scale = state.transform.scale;
   const cardW = LAYOUT.cardWidth;
-  const cardH = LAYOUT.cardLineHeight * LAYOUT.cardMaxLines + LAYOUT.cardPadding * 2 + 14; // 14 for header
+  // Default fallback height — only used for nodes that somehow lack cardHeight
+  // (shouldn't happen if layout was built in card mode).
+  const defaultCardH = LAYOUT.cardHeaderHeight + LAYOUT.cardLineHeight + LAYOUT.cardPadding * 2;
+  const cardHOf = (n: import("./types.js").LayoutNode): number =>
+    n.cardHeight ?? defaultCardH;
 
   // Faint session backgrounds first
   for (const band of layout.sessionBands) {
     if (!intersects(band, view)) continue;
     const w = band.maxX - band.minX + cardW;
-    const h = band.maxY - band.minY + cardH;
+    const h = band.maxY - band.minY + defaultCardH;
     const isHover = band.sessionId === state.hoveredSessionId;
     const isActive = band.sessionId === state.activeSessionId;
     ctx.globalAlpha = isActive ? 0.18 : isHover ? 0.14 : 0.05;
@@ -476,14 +716,15 @@ function renderCards(
     ctx.globalAlpha = 1;
   }
 
-  // Edges (parent center → child center)
+  // Edges (parent bottom-center → child top-center) — use each card's own height
   ctx.lineWidth = Math.max(1, 1 / scale);
   for (const e of layout.edges) {
     const from = layout.nodes.get(e.fromId);
     const to = layout.nodes.get(e.toId);
     if (!from || !to) continue;
+    const fromH = cardHOf(from);
     const fx = from.x + cardW / 2;
-    const fy = from.y + cardH;
+    const fy = from.y + fromH;
     const tx = to.x + cardW / 2;
     const ty = to.y;
     if (Math.max(fx, tx) < view.x0 || Math.min(fx, tx) > view.x1) continue;
@@ -505,10 +746,15 @@ function renderCards(
   const headerPx = 9;
   ctx.textBaseline = "top";
   for (const n of layout.nodes.values()) {
+    const h = cardHOf(n);
     if (n.x + cardW < view.x0 || n.x > view.x1) continue;
-    if (n.y + cardH < view.y0 || n.y > view.y1) continue;
-    drawCard(ctx, n, state, cardW, cardH, fontPx, headerPx);
+    if (n.y + h < view.y0 || n.y > view.y1) continue;
+    drawCard(ctx, n, state, cardW, h, fontPx, headerPx, colorCtx);
   }
+
+  if (state.subagentsCollapsed) drawSubagentBadges(ctx, layout, state, view, /*cardMode=*/ true);
+  drawTimelineGapLabels(ctx, layout, state, view, /*cardMode=*/ true);
+  drawMultiSelect(ctx, layout, state, /*cardMode=*/ true);
 
   // Selection ring (already part of card border for selected, but draw the LIVE pulse here)
   drawLiveTip(ctx, layout, state);
@@ -516,19 +762,20 @@ function renderCards(
 
 function drawCard(
   ctx: CanvasRenderingContext2D,
-  n: import("./types.js").LayoutNode,
+  n: LayoutNode,
   state: RenderState,
   cardW: number,
   cardH: number,
   fontPx: number,
   headerPx: number,
+  colorCtx: ColorContext,
 ): void {
   const x = n.x;
   const y = n.y;
   const isSelected = n.id === state.selectedId;
   const isHovered = n.id === state.hoveredId;
   const isHi = state.highlightedNodeIds?.has(n.id);
-  const color = nodeColor(n.role, n.subtype, n.isSidechain);
+  const color = colorForNode(n, state.colorMode, colorCtx);
 
   // Card background
   ctx.fillStyle = isSelected ? "rgba(39, 39, 42, 0.98)" : "rgba(24, 24, 27, 0.92)";
@@ -569,18 +816,23 @@ function drawCard(
     ctx.textAlign = "left";
   }
 
-  // Body text — wrap to N lines
+  // Body text — wrap into the available body area inside this card. Lines available
+  // is derived from the card's actual height (which the layout sized for this
+  // node's preview length), so the text fits without external truncation.
   ctx.fillStyle = "#e4e4e7";
   ctx.font = `${fontPx}px ui-sans-serif, system-ui, sans-serif`;
   const text = n.preview || "(empty)";
+  const bodyTop = y + LAYOUT.cardPadding + LAYOUT.cardHeaderHeight;
+  const bodyHeight = cardH - LAYOUT.cardHeaderHeight - LAYOUT.cardPadding * 2;
+  const maxLines = Math.max(1, Math.floor(bodyHeight / LAYOUT.cardLineHeight));
   drawWrappedText(
     ctx,
     text,
     x + LAYOUT.cardPadding,
-    y + LAYOUT.cardPadding + headerPx + 6,
+    bodyTop,
     cardW - LAYOUT.cardPadding * 2,
     LAYOUT.cardLineHeight,
-    LAYOUT.cardMaxLines,
+    maxLines,
   );
 }
 
@@ -710,6 +962,155 @@ function drawForkEdges(
   ctx.globalAlpha = 1;
 }
 
+/**
+ * Timeline mode only: draw a "+Δt" label to the left of each node showing the
+ * gap from the previous chronological message in the same session. Lets you
+ * read "is this a 5-second gap or a 5-hour gap" at a glance without hovering.
+ * Skips gaps under 1 minute (always shown tight as the visual minimum) and
+ * skips small zoom levels where labels would clutter the canvas.
+ */
+function drawTimelineGapLabels(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  state: RenderState,
+  view: { x0: number; y0: number; x1: number; y1: number },
+  cardMode: boolean,
+): void {
+  if (!layout.nodeGapToPrev || layout.nodeGapToPrev.size === 0) return;
+  const scale = state.transform.scale;
+  if (scale < 0.6) return;
+  const fontPx = cardMode ? 9 : Math.max(8, 10 / scale);
+  ctx.font = `${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "right";
+  for (const [id, ms] of layout.nodeGapToPrev) {
+    if (ms < 60_000) continue; // sub-minute gaps not worth labeling
+    const n = layout.nodes.get(id);
+    if (!n) continue;
+    if (n.x < view.x0 - 200 || n.x > view.x1) continue;
+    if (n.y < view.y0 || n.y > view.y1) continue;
+    const text = formatGap(ms);
+    // Position to the left of the node/card top-edge with a small margin
+    const labelX = cardMode ? n.x - 6 : n.x - 6 / scale;
+    const labelY = cardMode ? n.y + 8 : n.y;
+    const w = ctx.measureText(text).width + (cardMode ? 8 : 8 / scale);
+    const h = cardMode ? 13 : 13 / scale;
+    // Background pill so labels stay readable over edges/hulls
+    ctx.fillStyle = "rgba(9, 9, 11, 0.75)";
+    roundRect(ctx, labelX - w, labelY - h / 2, w, h, h / 2);
+    ctx.fill();
+    // Tint long gaps amber, short gaps zinc — gives at-a-glance "big pause" signal
+    ctx.fillStyle = ms >= 3600_000 ? "#fbbf24" : ms >= 600_000 ? "#fde68a" : "#a1a1aa";
+    ctx.fillText(text, labelX - (cardMode ? 4 : 4 / scale), labelY);
+  }
+  ctx.textAlign = "left";
+}
+
+function formatGap(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `+${s}s`;
+  const m = Math.round(ms / 60_000);
+  if (m < 60) return `+${m}m`;
+  const h = Math.round(ms / 3600_000);
+  if (h < 24) return `+${h}h`;
+  const d = Math.round(ms / 86400_000);
+  return `+${d}d`;
+}
+
+/**
+ * Draw a small purple "+N" badge next to each parent that has subagents,
+ * when subagents are globally hidden. Purely informative — clicking does
+ * nothing yet (toggle the global visibility from the sidebar to expand).
+ *
+ * In dot mode the badge sits just to the right of the dot; in card mode
+ * it sits at the top-right corner of the card.
+ */
+function drawSubagentBadges(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  state: RenderState,
+  view: { x0: number; y0: number; x1: number; y1: number },
+  cardMode: boolean,
+): void {
+  if (layout.subagentCountByParent.size === 0) return;
+  const scale = state.transform.scale;
+  const fontPx = cardMode ? 9 : Math.max(8, 9 / scale);
+  ctx.font = `bold ${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "center";
+  for (const [parentId, count] of layout.subagentCountByParent) {
+    const n = layout.nodes.get(parentId);
+    if (!n) continue;
+    if (n.x < view.x0 || n.x > view.x1 || n.y < view.y0 || n.y > view.y1) continue;
+    const text = `+${count}`;
+    const w = ctx.measureText(text).width + (cardMode ? 8 : 8 / scale);
+    const h = cardMode ? 14 : 14 / scale;
+    let bx: number;
+    let by: number;
+    if (cardMode) {
+      // Top-right corner of the card. cardWidth = 260 layout units; height per-node.
+      bx = n.x + LAYOUT.cardWidth - w - 4;
+      by = n.y + 4;
+    } else {
+      const r = Math.max(LAYOUT.nodeRadius, 2.5 / scale);
+      bx = n.x + r + 4 / scale;
+      by = n.y - h / 2;
+    }
+    // Pill background
+    ctx.fillStyle = "rgba(192, 132, 252, 0.92)"; // violet — matches subagent dot color
+    ctx.strokeStyle = "rgba(9, 9, 11, 0.6)";
+    ctx.lineWidth = 1;
+    roundRect(ctx, bx, by, w, h, h / 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#1e1b3a";
+    ctx.fillText(text, bx + w / 2, by + h / 2);
+  }
+  ctx.textAlign = "left";
+}
+
+/**
+ * Per-session sparkline: assistant output-tokens per turn, drawn as a tiny bar
+ * chart along the top edge of the session band. Reveals which sessions are
+ * "thinking hard" (tall bars, late-game spikes) vs flat tool-bouncing without
+ * needing to zoom in. Normalized per-session so a small session's pattern
+ * isn't crushed by a huge one.
+ */
+function drawSessionSparklines(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  state: RenderState,
+  view: { x0: number; y0: number; x1: number; y1: number },
+): void {
+  const scale = state.transform.scale;
+  // Sparkline area in layout units — height depends on zoom so it stays readable
+  // on screen. Cap at 18px screen height so it never dominates the band.
+  const screenH = 18;
+  const layoutH = screenH / scale;
+  for (const band of layout.sessionBands) {
+    if (!intersects(band, view)) continue;
+    const spark = band.tokenSpark;
+    if (spark.length === 0) continue;
+    const widthPx = (band.maxX - band.minX) * scale;
+    if (widthPx < 60) continue; // too narrow to read
+    const bandW = band.maxX - band.minX;
+    const x0 = band.minX;
+    // Bars hugging the top of the band (just under the sticky label slot)
+    const y0 = band.minY + layoutH;
+    const max = spark.reduce((m, v) => Math.max(m, v), 0);
+    if (max <= 0) continue;
+    const barW = bandW / spark.length;
+    const isHover = band.sessionId === state.hoveredSessionId;
+    ctx.fillStyle = `rgba(251, 191, 36, ${isHover ? 0.7 : 0.45})`; // amber-400, matches assistant role
+    for (let i = 0; i < spark.length; i++) {
+      const v = spark[i]!;
+      if (v <= 0) continue;
+      const h = (v / max) * layoutH;
+      ctx.fillRect(x0 + i * barW, y0 - h, Math.max(barW * 0.8, 1 / scale), h);
+    }
+  }
+}
+
 function drawSessionLabels(
   ctx: CanvasRenderingContext2D,
   layout: Layout,
@@ -731,11 +1132,109 @@ function drawSessionLabels(
   }
 }
 
+/**
+ * Draw a sticky banner at the top of the viewport for each session whose band
+ * has scrolled past the top edge. Banner width matches the band's x extent on
+ * screen (clamped to viewport), so multiple visible sessions stack horizontally
+ * if they're side-by-side.
+ */
+function drawStickySessionLabels(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  transform: Transform,
+  state: RenderState,
+  viewportWidth: number,
+  viewportHeight: number,
+  dpr: number,
+): void {
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const stickyTop = 8;
+  const bannerH = 20;
+  const fontPx = 11;
+  ctx.font = `${fontPx}px ui-monospace, monospace`;
+  ctx.textBaseline = "middle";
+  for (const band of layout.sessionBands) {
+    const bandTopY = band.minY * transform.scale + transform.ty;
+    const bandBotY = band.maxY * transform.scale + transform.ty;
+    // Only stick when the label has scrolled past the top AND the band is still
+    // partially visible below the sticky banner.
+    if (bandTopY >= stickyTop) continue;
+    if (bandBotY <= stickyTop + bannerH) continue;
+    const bandLeftX = band.minX * transform.scale + transform.tx;
+    const bandRightX = band.maxX * transform.scale + transform.tx;
+    if (bandRightX < 8 || bandLeftX > viewportWidth - 8) continue;
+    const x = Math.max(8, bandLeftX);
+    const right = Math.min(viewportWidth - 8, bandRightX);
+    const w = Math.max(60, right - x);
+    const isHover = band.sessionId === state.hoveredSessionId;
+    const isActive = band.sessionId === state.activeSessionId;
+    // Banner background — project-tinted, more opaque when active
+    ctx.fillStyle = projectColor(band.projectSlug);
+    ctx.globalAlpha = isActive ? 0.35 : isHover ? 0.28 : 0.22;
+    ctx.fillRect(x, stickyTop, w, bannerH);
+    // Bottom edge line for separation
+    ctx.globalAlpha = 0.7;
+    ctx.fillRect(x, stickyTop + bannerH - 1, w, 1);
+    ctx.globalAlpha = 1;
+    // Label text
+    ctx.fillStyle = isActive || isHover ? "#fafafa" : "#d4d4d8";
+    const label = sessionLabel(band);
+    // Clip to banner so long labels don't bleed past the band's x range
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x + 8, stickyTop, w - 16, bannerH);
+    ctx.clip();
+    ctx.fillText(label, x + 8, stickyTop + bannerH / 2);
+    ctx.restore();
+    // Active session: pulsing emerald dot before the label
+    if (isActive) {
+      const pulse = 0.5 + 0.5 * Math.sin(state.nowMs / 350);
+      ctx.fillStyle = `rgba(52, 211, 153, ${0.6 + 0.4 * pulse})`;
+      ctx.beginPath();
+      ctx.arc(x + 4, stickyTop + bannerH / 2, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
 function sessionLabel(band: SessionBand): string {
   const id = band.sessionId.slice(0, 8);
   const count = band.nodeCount;
   const prompt = band.firstPrompt.slice(0, 30);
   return prompt ? `${id} · ${count}n · ${prompt}` : `${id} · ${count}n`;
+}
+
+/** Cyan outlines around multi-selected nodes — distinct from hover (white)
+ *  and single-select (amber). Drawn in both dot and card modes. */
+function drawMultiSelect(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  state: RenderState,
+  cardMode: boolean,
+): void {
+  if (!state.multiSelectedIds || state.multiSelectedIds.size === 0) return;
+  const scale = state.transform.scale;
+  ctx.strokeStyle = "rgba(34, 211, 238, 0.85)"; // cyan-400
+  ctx.lineWidth = Math.max(1.5, 2 / scale);
+  for (const id of state.multiSelectedIds) {
+    const n = layout.nodes.get(id);
+    if (!n) continue;
+    if (cardMode) {
+      const h = n.cardHeight ?? LAYOUT.cardHeaderHeight + LAYOUT.cardLineHeight + LAYOUT.cardPadding * 2;
+      ctx.beginPath();
+      const r = 6;
+      ctx.roundRect?.(n.x - 1, n.y - 1, LAYOUT.cardWidth + 2, h + 2, r);
+      ctx.stroke();
+    } else {
+      const baseR = Math.max(LAYOUT.nodeRadius, 2.5 / scale);
+      const r = baseR * nodeSizeMul(n.role, n.subtype) + Math.max(3, 4 / scale);
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
 }
 
 function drawSelectionAndHover(
@@ -817,8 +1316,9 @@ export function hitTest(
   if (lod === "detail") {
     if (nodeStyle === "cards") {
       const cardW = LAYOUT.cardWidth;
-      const cardH = LAYOUT.cardLineHeight * LAYOUT.cardMaxLines + LAYOUT.cardPadding * 2 + 14;
+      const fallback = LAYOUT.cardHeaderHeight + LAYOUT.cardLineHeight + LAYOUT.cardPadding * 2;
       for (const n of layout.nodes.values()) {
+        const cardH = n.cardHeight ?? fallback;
         if (lx >= n.x && lx <= n.x + cardW && ly >= n.y && ly <= n.y + cardH) {
           return { kind: "node", id: n.id };
         }

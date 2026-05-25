@@ -41,10 +41,10 @@ export function buildLayout(
   allowedSessions: Set<string> | null = null,
   nodeStyle: NodeStyle = "dots",
 ): Layout {
-  // Card mode uses larger spacing so cards can fit side-by-side and stack without
-  // overlapping. Otherwise spacing is the dot defaults.
-  const cardTotalH = LAYOUT.cardLineHeight * LAYOUT.cardMaxLines + LAYOUT.cardPadding * 2;
-  const SPACING_V = nodeStyle === "cards" ? cardTotalH + LAYOUT.cardSpacingV : LAYOUT.nodeSpacingV;
+  // Default vertical step (dots, or column-mode prompt placement). Card-mode
+  // uses per-node heights computed from preview text length instead — fixed
+  // SPACING_V caused short cards to leave gaps and long cards to overlap.
+  const SPACING_V = LAYOUT.nodeSpacingV;
   const SPACING_H = nodeStyle === "cards" ? LAYOUT.cardSpacingH : LAYOUT.nodeSpacingH;
   // Filter nodes by scope (+ optional session allow-list from the facet filter)
   let scopeNodes = scopeProject
@@ -105,10 +105,43 @@ export function buildLayout(
     sortedChildren.set(parentId, arr);
   }
 
+  /**
+   * Card mode: per-node visual card height (no inter-card spacing).
+   *
+   * Cards grow vertically to fit text instead of being a fixed-size box, which
+   * would either overlap on long messages or waste space on short ones. We
+   * estimate wrapped line count from `preview.length / cardCharsPerLine`,
+   * capped at `cardMaxLines`. The renderer uses the same formula and reads
+   * the value back from `LayoutNode.cardHeight`.
+   */
+  const cardHeightFor = (id: string): number => {
+    const n = nodeMap.get(id);
+    const text = n?.preview ?? "";
+    const rawLines = Math.max(1, Math.ceil(text.length / LAYOUT.cardCharsPerLine));
+    const lines = Math.min(rawLines, LAYOUT.cardMaxLines);
+    return LAYOUT.cardHeaderHeight + LAYOUT.cardLineHeight * lines + LAYOUT.cardPadding * 2;
+  };
+
+  /** Vertical layout step for a node: card height + spacing in card mode, fixed in dot mode. */
+  const ownHeight = (id: string): number => {
+    if (nodeStyle !== "cards") return SPACING_V;
+    return cardHeightFor(id) + LAYOUT.cardSpacingV;
+  };
+
   // Forks set (for highlighting): parent uuids whose children belong to 2+ sessions
   const forkParents = new Set<string>();
   for (const f of payload.forks) {
     if (nodeMap.has(f.parentUuid)) forkParents.add(f.parentUuid);
+  }
+
+  // Subagent counts per spawning parent uuid — computed from the RAW scope nodes
+  // so it's accurate even when subagents are hidden by visibility filter.
+  // A subagent "root" is a sidechain node with a non-null parentId (parser
+  // attaches the spawning Task tool_use uuid as parentId).
+  const subagentCountByParent = new Map<string, number>();
+  for (const n of scopeNodes) {
+    if (!n.isSidechain || n.parentId == null) continue;
+    subagentCountByParent.set(n.parentId, (subagentCountByParent.get(n.parentId) ?? 0) + 1);
   }
 
   // Per-session start time (earliest VISIBLE node timestamp) for stable ordering.
@@ -169,18 +202,19 @@ export function buildLayout(
   };
   const computeHeight = (id: string): number => {
     if (subtreeHeight.has(id)) return subtreeHeight.get(id)!;
-    if (heightVisited.has(id)) return SPACING_V;
+    if (heightVisited.has(id)) return ownHeight(id);
     heightVisited.add(id);
+    const myH = ownHeight(id);
     const kids = sortedChildren.get(id);
     if (!kids || kids.length === 0) {
-      subtreeHeight.set(id, SPACING_V);
-      return SPACING_V;
+      subtreeHeight.set(id, myH);
+      return myH;
     }
     let totalKidHeight = 0;
     for (const k of kids) {
       totalKidHeight += computeHeight(k);
     }
-    subtreeHeight.set(id, SPACING_V + totalKidHeight);
+    subtreeHeight.set(id, myH + totalKidHeight);
     return subtreeHeight.get(id)!;
   };
   for (const r of roots) {
@@ -200,7 +234,7 @@ export function buildLayout(
     const isPrompt = (n: ForestNode) => n.role === "user" && n.subtype === "prompt";
 
     const placeNode = (n: ForestNode, x: number, y: number) => {
-      layoutNodes.set(n.id, {
+      const node: LayoutNode = {
         id: n.id,
         x, y,
         projectSlug: n.projectSlug,
@@ -211,8 +245,17 @@ export function buildLayout(
         isFork: forkParents.has(n.id),
         isShared: n.sessionsIn > 1,
         preview: n.preview,
-      });
+        timestamp: n.timestamp,
+        outputTokens: n.outputTokens,
+      };
+      if (nodeStyle === "cards") node.cardHeight = cardHeightFor(n.id);
+      layoutNodes.set(n.id, node);
     };
+
+    // Horizontal step between adjacent chain nodes. In dot mode the chain is a
+    // tight 18px stagger (dots are 4px). In card mode each card is 260px wide,
+    // so we step by cardWidth + a small gap to avoid overlap.
+    const CHAIN_STEP_H = nodeStyle === "cards" ? LAYOUT.cardWidth + 16 : LAYOUT.columnSideH;
 
     /** Place a subtree in column-mode. Returns the max Y reached (for sibling placement). */
     const placeColumnSubtree = (rootId: string, baseX: number, baseY: number): number => {
@@ -220,8 +263,10 @@ export function buildLayout(
       const rootNode = nodeMap.get(rootId);
       if (!rootNode) return baseY;
       // Walk linear chain to the right. Collect any prompt children along the way for placement below.
+      // Track tallest card in this row so the next row doesn't overlap it.
       let cur: string = rootId;
       let x = baseX;
+      let rowMaxH = 0;
       const promptChildren: string[] = [];
       const seenInChain = new Set<string>();
       while (true) {
@@ -230,6 +275,10 @@ export function buildLayout(
         if (seenInChain.has(cur)) break; // cycle defense
         seenInChain.add(cur);
         placeNode(node, x, baseY);
+        if (nodeStyle === "cards") {
+          const h = cardHeightFor(cur);
+          if (h > rowMaxH) rowMaxH = h;
+        }
         const kids = sortedChildren.get(cur);
         if (!kids || kids.length === 0) break;
         let nextSideKid: string | null = null;
@@ -244,22 +293,28 @@ export function buildLayout(
         }
         if (!nextSideKid) break;
         edges.push({ fromId: cur, toId: nextSideKid, isFork: false });
-        x += LAYOUT.columnSideH;
+        x += CHAIN_STEP_H;
         cur = nextSideKid;
       }
-      // Place prompt children below, sequentially
-      let nextY = baseY + LAYOUT.columnSpineV;
+      // Vertical step from this row to the next prompt. In card mode use the
+      // tallest card in the row + spacing so the next row clears it; in dot
+      // mode use the fixed columnSpineV.
+      const stepV = nodeStyle === "cards"
+        ? rowMaxH + LAYOUT.cardSpacingV
+        : LAYOUT.columnSpineV;
+      let nextY = baseY + stepV;
       for (const pId of promptChildren) {
         if (layoutNodes.has(pId)) continue;
-        // Edge from this prompt's parent (last node we walked) to the prompt — but we've already
-        // walked past. Just emit edge from the chain's final node IF the prompt's parent is in chain.
         const promptNode = nodeMap.get(pId);
         if (promptNode && promptNode.parentId && layoutNodes.has(promptNode.parentId)) {
           edges.push({ fromId: promptNode.parentId, toId: pId, isFork: false });
         }
-        nextY = placeColumnSubtree(pId, baseX, nextY) + LAYOUT.columnSpineV;
+        const childStep = nodeStyle === "cards"
+          ? cardHeightFor(pId) + LAYOUT.cardSpacingV
+          : LAYOUT.columnSpineV;
+        nextY = placeColumnSubtree(pId, baseX, nextY) + childStep;
       }
-      return Math.max(baseY, nextY - LAYOUT.columnSpineV);
+      return Math.max(baseY, nextY - (nodeStyle === "cards" ? LAYOUT.cardSpacingV : LAYOUT.columnSpineV));
     };
 
     // Group roots by session, in session-start order
@@ -347,6 +402,7 @@ export function buildLayout(
         acc.firstPrompt = n.preview;
       }
     }
+    const sparks = buildTokenSparks(layoutNodes);
     const sessionBands: SessionBand[] = [];
     for (const a of bandAcc.values()) {
       sessionBands.push({
@@ -354,11 +410,183 @@ export function buildLayout(
         minX: a.minX - LAYOUT.nodeRadius - 2, maxX: a.maxX + LAYOUT.nodeRadius + 2,
         minY: a.minY - LAYOUT.nodeRadius - 2, maxY: a.maxY + LAYOUT.nodeRadius + 2,
         nodeCount: a.nodeCount, firstPrompt: a.firstPrompt,
+        tokenSpark: sparks.get(a.sessionId) ?? [],
       });
     }
     sessionBands.sort((a, b) => a.minY - b.minY || a.minX - b.minX);
 
-    return { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks: [] };
+    return { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks: [], subagentCountByParent };
+  }
+
+  // ───── Timeline layout: Y proportional to timestamp within each session ─────
+  // One column per session, ordered left-to-right by session start time. Within
+  // a column, vertical gaps between adjacent messages reflect real elapsed
+  // time — so burst sessions look tight and "came back next day" gaps look
+  // distinct. Gap is clamped [MIN_GAP, MAX_GAP] so a 1-week pause isn't a mile
+  // of empty space and a 5-second reply isn't invisible.
+  if (direction === "timeline") {
+    const layoutNodes = new Map<string, LayoutNode>();
+    const edges: LayoutEdge[] = [];
+    const projectBands = new Map<string, { minX: number; maxX: number; minY: number; maxY: number }>();
+
+    const COLUMN_W = nodeStyle === "cards" ? LAYOUT.cardWidth + 60 : 90;
+    const PX_PER_MIN = 6;
+    const MIN_GAP = 16;
+    const MAX_GAP = 140;
+
+    const sessionsInOrder = [...new Set(visibleNodes.map((n) => n.sessionId))].sort((a, b) => {
+      const sa = sessionStartTime.get(a) ?? "";
+      const sb = sessionStartTime.get(b) ?? "";
+      return sa.localeCompare(sb);
+    });
+
+    const baseY = mode === "all-projects" ? LAYOUT.projectLabelHeight : 0;
+    const nodeGapToPrev = new Map<string, number>();
+    const timelineAnchors = new Map<
+      string,
+      { x: number; xRight: number; lastY: number; lastTs: number }
+    >();
+
+    for (let i = 0; i < sessionsInOrder.length; i++) {
+      const sid = sessionsInOrder[i]!;
+      const colX = i * COLUMN_W;
+      const nodesInSession = visibleNodes
+        .filter((n) => n.sessionId === sid)
+        .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+      if (nodesInSession.length === 0) continue;
+      const proj = nodesInSession[0]!.projectSlug;
+
+      let prevTs: number | null = null;
+      let cy = baseY;
+      for (const n of nodesInSession) {
+        const ts = Date.parse(n.timestamp);
+        if (prevTs !== null && Number.isFinite(ts) && Number.isFinite(prevTs)) {
+          const dMin = Math.max(0, (ts - prevTs) / 60000);
+          const gap = Math.min(MAX_GAP, Math.max(MIN_GAP, dMin * PX_PER_MIN));
+          cy += gap;
+          nodeGapToPrev.set(n.id, ts - prevTs);
+        }
+        const node: LayoutNode = {
+          id: n.id,
+          x: colX,
+          y: cy,
+          projectSlug: n.projectSlug,
+          sessionId: n.sessionId,
+          role: n.role,
+          subtype: n.subtype,
+          isSidechain: n.isSidechain,
+          isFork: forkParents.has(n.id),
+          isShared: n.sessionsIn > 1,
+          preview: n.preview,
+          timestamp: n.timestamp,
+          outputTokens: n.outputTokens,
+        };
+        if (nodeStyle === "cards") {
+          node.cardHeight = cardHeightFor(n.id);
+          // Advance cy past the card body so the next message lands below it.
+          // (Gap is added at top of next iter; here we account for the card's own height.)
+          cy += node.cardHeight;
+        }
+        layoutNodes.set(n.id, node);
+        if (Number.isFinite(ts)) prevTs = ts;
+      }
+
+      // Record anchor: latest node's Y + ts so the now-line can extrapolate
+      // using the same gap formula. xRight reflects how wide the column needs
+      // to be for the now-line span (covers the card width in cards mode).
+      const lastNode = nodesInSession[nodesInSession.length - 1]!;
+      const lastTs = Date.parse(lastNode.timestamp);
+      if (Number.isFinite(lastTs)) {
+        timelineAnchors.set(sid, {
+          x: colX,
+          xRight: colX + (nodeStyle === "cards" ? LAYOUT.cardWidth : 30),
+          lastY: layoutNodes.get(lastNode.id)?.y ?? cy,
+          lastTs,
+        });
+      }
+
+      // Project band
+      const minY = baseY;
+      const maxY = cy;
+      const maxX = colX + (nodeStyle === "cards" ? LAYOUT.cardWidth : 0);
+      const pb = projectBands.get(proj);
+      if (!pb) projectBands.set(proj, { minX: colX, maxX, minY, maxY });
+      else {
+        pb.minX = Math.min(pb.minX, colX);
+        pb.maxX = Math.max(pb.maxX, maxX);
+        pb.maxY = Math.max(pb.maxY, maxY);
+      }
+    }
+
+    // Edges from parent → child (chronologically: in timeline mode the child is
+    // visually below the parent inside the same column; cross-session forks go
+    // sideways to another column)
+    for (const [parentId, kids] of sortedChildren) {
+      if (!layoutNodes.has(parentId)) continue;
+      for (const kid of kids) {
+        if (!layoutNodes.has(kid)) continue;
+        const parentSession = layoutNodes.get(parentId)!.sessionId;
+        const kidSession = layoutNodes.get(kid)!.sessionId;
+        edges.push({ fromId: parentId, toId: kid, isFork: parentSession !== kidSession });
+      }
+    }
+
+    // Bounds
+    const bounds: Bounds = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+    if (layoutNodes.size > 0) {
+      bounds.minX = Infinity; bounds.minY = Infinity;
+      bounds.maxX = -Infinity; bounds.maxY = -Infinity;
+      for (const n of layoutNodes.values()) {
+        if (n.x < bounds.minX) bounds.minX = n.x;
+        if (n.y < bounds.minY) bounds.minY = n.y;
+        if (n.x > bounds.maxX) bounds.maxX = n.x;
+        if (n.y > bounds.maxY) bounds.maxY = n.y;
+      }
+      bounds.minX -= LAYOUT.nodeRadius * 2;
+      bounds.minY -= LAYOUT.nodeRadius * 2;
+      bounds.maxX += LAYOUT.nodeRadius * 2;
+      bounds.maxY += LAYOUT.nodeRadius * 2;
+    }
+
+    // Session bands + sparks
+    const bandAcc = new Map<string, { sessionId: string; projectSlug: string; minX: number; maxX: number; minY: number; maxY: number; nodeCount: number; firstPromptTs: string; firstPrompt: string }>();
+    for (const ln of layoutNodes.values()) {
+      let acc = bandAcc.get(ln.sessionId);
+      const cardOffsetX = nodeStyle === "cards" ? LAYOUT.cardWidth : 0;
+      const cardOffsetY = nodeStyle === "cards" ? (ln.cardHeight ?? 0) : 0;
+      if (!acc) {
+        acc = { sessionId: ln.sessionId, projectSlug: ln.projectSlug, minX: ln.x, maxX: ln.x + cardOffsetX, minY: ln.y, maxY: ln.y + cardOffsetY, nodeCount: 0, firstPromptTs: "", firstPrompt: "" };
+        bandAcc.set(ln.sessionId, acc);
+      }
+      acc.minX = Math.min(acc.minX, ln.x);
+      acc.maxX = Math.max(acc.maxX, ln.x + cardOffsetX);
+      acc.minY = Math.min(acc.minY, ln.y);
+      acc.maxY = Math.max(acc.maxY, ln.y + cardOffsetY);
+      acc.nodeCount += 1;
+    }
+    for (const n of scopeNodes) {
+      if (n.role !== "user" || n.subtype !== "prompt") continue;
+      const acc = bandAcc.get(n.sessionId);
+      if (!acc) continue;
+      if (!acc.firstPromptTs || n.timestamp < acc.firstPromptTs) {
+        acc.firstPromptTs = n.timestamp;
+        acc.firstPrompt = n.preview;
+      }
+    }
+    const sparks = buildTokenSparks(layoutNodes);
+    const sessionBands: SessionBand[] = [];
+    for (const a of bandAcc.values()) {
+      sessionBands.push({
+        sessionId: a.sessionId, projectSlug: a.projectSlug,
+        minX: a.minX - LAYOUT.nodeRadius - 2, maxX: a.maxX + LAYOUT.nodeRadius + 2,
+        minY: a.minY - LAYOUT.nodeRadius - 2, maxY: a.maxY + LAYOUT.nodeRadius + 2,
+        nodeCount: a.nodeCount, firstPrompt: a.firstPrompt,
+        tokenSpark: sparks.get(a.sessionId) ?? [],
+      });
+    }
+    sessionBands.sort((a, b) => a.minX - b.minX || a.minY - b.minY);
+
+    return { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks: [], subagentCountByParent, nodeGapToPrev, timelineAnchors };
   }
 
   // Pick a row-wrap width that targets roughly square overall aspect ratio.
@@ -418,6 +646,9 @@ export function buildLayout(
       payloadIndex: payload,
       spacingV: SPACING_V,
       spacingH: SPACING_H,
+      ownHeight,
+      cardHeightFor,
+      nodeStyle,
     });
 
     // Project band: track the y-range that this project occupies + max width
@@ -516,6 +747,7 @@ export function buildLayout(
       acc.firstPrompt = n.preview;
     }
   }
+  const sparks = buildTokenSparks(layoutNodes);
   const sessionBands: SessionBand[] = [];
   for (const a of bandAcc.values()) {
     sessionBands.push({
@@ -527,6 +759,7 @@ export function buildLayout(
       maxY: a.maxY + LAYOUT.nodeRadius + 2,
       nodeCount: a.nodeCount,
       firstPrompt: a.firstPrompt,
+      tokenSpark: sparks.get(a.sessionId) ?? [],
     });
   }
   // Stable sort by minX then minY for consistent draw order
@@ -582,7 +815,7 @@ export function buildLayout(
     }
   }
 
-  return { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks };
+  return { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks, subagentCountByParent };
 }
 
 function placeTree(
@@ -600,11 +833,15 @@ function placeTree(
     payloadIndex: ForestPayload;
     spacingV: number;
     spacingH: number;
+    ownHeight: (id: string) => number;
+    cardHeightFor: (id: string) => number;
+    nodeStyle: NodeStyle;
   },
 ): void {
   const node = ctx.nodeMap.get(id);
   if (!node) return;
   if (ctx.layoutNodes.has(id)) return;
+  const myOwn = ctx.ownHeight(id);
   const layoutNode: LayoutNode = {
     id,
     x: xLeft,
@@ -617,16 +854,19 @@ function placeTree(
     isFork: ctx.forkParents.has(id),
     isShared: node.sessionsIn > 1,
     preview: node.preview,
+    timestamp: node.timestamp,
+    outputTokens: node.outputTokens,
   };
+  if (ctx.nodeStyle === "cards") layoutNode.cardHeight = ctx.cardHeightFor(id);
   ctx.layoutNodes.set(id, layoutNode);
 
   const kids = ctx.sortedChildren.get(id);
   if (!kids || kids.length === 0) return;
 
-  // Vertical stacking: first child directly below parent (continues the spine);
-  // subsequent siblings step right by ctx.spacingH so their branches are
-  // distinguishable from the spine and edges have somewhere to curve to.
-  let cy = yTop + ctx.spacingV;
+  // First child sits immediately below the parent's own footprint
+  // (myOwn includes the per-row padding/spacing). Subsequent siblings step
+  // right by ctx.spacingH so fork branches are distinguishable from the spine.
+  let cy = yTop + myOwn;
   for (let i = 0; i < kids.length; i++) {
     const kid = kids[i]!;
     const kh = ctx.subtreeHeight.get(kid)!;
@@ -639,4 +879,45 @@ function placeTree(
     });
     cy += kh;
   }
+}
+
+/**
+ * Compute "where would wall-clock now land" in a session's timeline Y-space.
+ * Uses the same clamped-gap formula as the timeline placement code so the
+ * now-line is consistent with how the existing nodes were placed.
+ */
+export function timelineNowY(
+  anchor: { lastY: number; lastTs: number },
+  nowMs: number,
+): number {
+  const PX_PER_MIN = 6;
+  const MIN_GAP = 16;
+  const MAX_GAP = 140;
+  const dMin = Math.max(0, (nowMs - anchor.lastTs) / 60000);
+  const gap = Math.min(MAX_GAP, Math.max(MIN_GAP, dMin * PX_PER_MIN));
+  return anchor.lastY + gap;
+}
+
+/**
+ * Per-session output-tokens series, in chronological order, restricted to
+ * assistant turns (users don't produce output tokens). Used by the session-band
+ * sparkline overlay. Returns an empty array for sessions with no assistant turns.
+ */
+function buildTokenSparks(layoutNodes: Map<string, LayoutNode>): Map<string, number[]> {
+  const bySession = new Map<string, LayoutNode[]>();
+  for (const n of layoutNodes.values()) {
+    if (n.role !== "assistant") continue;
+    let arr = bySession.get(n.sessionId);
+    if (!arr) {
+      arr = [];
+      bySession.set(n.sessionId, arr);
+    }
+    arr.push(n);
+  }
+  const result = new Map<string, number[]>();
+  for (const [sid, nodes] of bySession) {
+    nodes.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    result.set(sid, nodes.map((n) => n.outputTokens));
+  }
+  return result;
 }

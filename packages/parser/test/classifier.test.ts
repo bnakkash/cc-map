@@ -42,9 +42,9 @@ describe("classify", () => {
     expect(r).toEqual({ role: "user", subtype: "tool-result" });
   });
 
-  it("marks assistant", () => {
+  it("marks assistant with text subtype for plain-text replies", () => {
     const r = classify({ type: "assistant", message: { role: "assistant", content: "hi" } });
-    expect(r).toEqual({ role: "assistant" });
+    expect(r).toEqual({ role: "assistant", subtype: "text" });
   });
 
   it("ignores non-graph types", () => {

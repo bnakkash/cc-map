@@ -1,6 +1,7 @@
 import chokidar from "chokidar";
 import { stat } from "node:fs/promises";
 import { basename, dirname, join, relative, sep } from "node:path";
+import { discoverFiles } from "./forest.js";
 import { tailFromOffset } from "./jsonl.js";
 import type { Delta, GraphNode, SessionMeta } from "./types.js";
 
@@ -88,7 +89,41 @@ export function startWatcher(opts: WatcherOptions): () => Promise<void> {
   watcher.on("add", handleAdd);
   watcher.on("change", handleChange);
 
+  // Backstop poller: chokidar on Windows is unreliable for both file CREATION
+  // and APPENDS, so we run our own discovery + size-change check every 2s.
+  //   1. Discover new files via discoverFiles; handleAdd any not in cursors
+  //   2. For each known cursor, stat the file; if size > offset, call handleChange
+  // handleChange is idempotent (just reads bytes past offset) so duplicate
+  // calls with chokidar are safe.
+  const discoveryInterval = setInterval(async () => {
+    try {
+      // 1. New files
+      const files = await discoverFiles(opts.projectsRoot);
+      for (const f of files) {
+        if (!cursors.has(f.filePath)) {
+          // eslint-disable-next-line no-console
+          console.log(`[watcher] backstop discovered new file: ${f.filePath}`);
+          await handleAdd(f.filePath);
+        }
+      }
+      // 2. Existing files that grew
+      for (const [filePath, cursor] of cursors) {
+        try {
+          const st = await stat(filePath);
+          if (st.size > cursor.offset) {
+            await handleChange(filePath);
+          }
+        } catch {
+          // file may have been deleted; ignore
+        }
+      }
+    } catch {
+      // ignore top-level errors
+    }
+  }, 2000);
+
   return async () => {
+    clearInterval(discoveryInterval);
     await watcher.close();
   };
 }

@@ -80,6 +80,12 @@ export interface LayoutNode {
   isFork: boolean;
   isShared: boolean; // appears in 2+ sessions
   preview: string;
+  /** Card height (layout units) in card mode — varies per node based on preview length. */
+  cardHeight?: number;
+  /** ISO timestamp — copied from ForestNode for color-by-recency rendering. */
+  timestamp: string;
+  /** Output tokens — copied from ForestNode for color-by-cost rendering. */
+  outputTokens: number;
 }
 
 export interface LayoutEdge {
@@ -106,6 +112,10 @@ export interface SessionBand {
   nodeCount: number;
   /** First user prompt (preview) — used as a session "title". */
   firstPrompt: string;
+  /** Per-assistant-turn output-token series, in chronological order. Used by
+   *  the sparkline overlay to show "thinking intensity" across the session
+   *  without zooming into individual messages. */
+  tokenSpark: number[];
 }
 
 export interface Layout {
@@ -118,11 +128,52 @@ export interface Layout {
   sessionBands: SessionBand[];
   /** Dashed links between sequential roots of the same session — shows reading order. */
   sequenceLinks: SequenceLink[];
+  /** Number of subagent roots spawned by each parent uuid. Always computed from
+   *  the raw forest, regardless of subagent visibility — so when subagents are
+   *  hidden the renderer can draw a "+N" badge on the parent to signal what
+   *  would expand. */
+  subagentCountByParent: Map<string, number>;
+  /** Timeline mode only: ms gap from previous chronological node in the same
+   *  session. Used by the renderer to draw "+Xm" / "+Xh" / "+Xd" labels so
+   *  users can see real time gaps without hovering each one. */
+  nodeGapToPrev?: Map<string, number>;
+  /** Timeline mode only: per-session anchor info so we can extrapolate "where
+   *  is wall-clock now" in that session's Y space, for the live now-line. */
+  timelineAnchors?: Map<
+    string,
+    {
+      /** Layout-X of the session column. */
+      x: number;
+      /** Layout-X of the column's right edge. */
+      xRight: number;
+      /** Y of the last (chronologically latest) placed node in this session. */
+      lastY: number;
+      /** Timestamp ms of that last node. */
+      lastTs: number;
+    }
+  >;
 }
 
 export type ViewMode = "per-project" | "all-projects";
-export type LayoutDirection = "grid" | "column";
+/**
+ *  - grid: square-ish tree-map, fork siblings stack vertically
+ *  - column: each session a row; prompts vertical, replies horizontal
+ *  - timeline: one column per session ordered left-to-right by session start;
+ *    Y is timestamp-proportional within each session (with capped gaps so a
+ *    week-long pause doesn't blow up the layout). Reveals temporal patterns
+ *    invisible in topology layouts.
+ */
+export type LayoutDirection = "grid" | "column" | "timeline";
 export type NodeStyle = "dots" | "cards";
+/**
+ * How nodes are colored.
+ *  - role: by user/assistant/subtype (the original)
+ *  - recency: gray → emerald gradient mapped onto each node's timestamp,
+ *    so the most recent activity glows. Great for "what did I do today."
+ *  - cost: gray → orange/red mapped onto assistant output-token spend,
+ *    so expensive turns pop out. Great for finding "what burned the budget."
+ */
+export type ColorMode = "role" | "recency" | "cost";
 
 /**
  * A user-created top-level workspace. Has a name + a curated list of session
@@ -219,15 +270,19 @@ export const LAYOUT = {
   columnSessionGap: 180,
   // ───── Card mode (text-box rendering) ─────
   /** Card width in layout units. */
-  cardWidth: 220,
-  /** Card line height. Card total height = lineHeight × visible lines + padding. */
+  cardWidth: 260,
+  /** Card line height. */
   cardLineHeight: 14,
   /** Padding inside each card. */
   cardPadding: 8,
-  /** Vertical spacing between cards in card mode (replaces nodeSpacingV). */
-  cardSpacingV: 12,
-  /** Horizontal spacing between sibling cards in card mode (replaces nodeSpacingH). */
-  cardSpacingH: 240,
-  /** Max preview lines shown per card. */
-  cardMaxLines: 4,
+  /** Height of the card header (role label row). */
+  cardHeaderHeight: 16,
+  /** Vertical gap between adjacent cards. */
+  cardSpacingV: 14,
+  /** Horizontal spacing between sibling cards. */
+  cardSpacingH: 280,
+  /** Approximate chars per line at cardWidth — used for height estimation. */
+  cardCharsPerLine: 38,
+  /** Hard cap on lines per card (above this we ellipsize). */
+  cardMaxLines: 12,
 } as const;

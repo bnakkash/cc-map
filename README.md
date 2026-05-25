@@ -1,77 +1,165 @@
 # cc-map
 
-Visualize Claude Code CLI sessions. Two views over the same data:
+A 2D pannable map of every Claude Code session you've ever had. Watches
+`~/.claude/projects/` and renders all sessions as a forest you can pan, zoom,
+filter, search, group, and bookmark. Live-updates as you type new prompts in
+any active Claude Code instance.
 
-- **Session viewer** — a chip column down the side of every prompt and reply in a session, click to read. Solves the "I sent five prompts without reading the replies and now I have to scroll up forever" problem.
-- **Tree-map** (Phase 2) — a 2D pannable canvas of every session you've ever had, with `--fork-session` branches and subagent side-chains visible at once.
+Local-only. No cloud. No data leaves your machine.
 
-Local-only. Reads `~/.claude/projects/` directly. No cloud, no auth beyond the local-server token.
+![cc-map screenshot placeholder — drop one in here when you take it]()
 
-## Status
+## What it solves
 
-Phase 1 in progress. See `../../../.claude/plans/i-want-to-start-ticklish-lecun.md` for the full plan and pre-build spike results.
-
-## Layout
-
-```
-packages/
-  parser/   pure TS, DOM-free, parses Claude Code JSONL into a forest
-  web/      React + Vite UI (chip column + message pane; tree-map canvas in Phase 2)
-apps/
-  server/   Fastify on 127.0.0.1: serves UI, watches files, SessionStart hook endpoint
-```
+Originally: "I fired off 5 prompts to Claude Code without reading the replies,
+now I can't find reply #2 anywhere." Grew into a workspace for browsing across
+all sessions (timelines, projects, forks, subagents) and spawning new ones.
 
 ## Quick start
 
 ```sh
-# 1. install
 npm install
-
-# 2. build the UI bundle (served by the local server)
-npm run build --workspace=@cc-map/web
-
-# 3. build the parser (server depends on it)
-npm run build --workspace=@cc-map/parser
-
-# 4. run the server (watches ~/.claude/projects/ for live updates)
-npm run dev
+npm run dev          # builds parser + web, starts Fastify on 127.0.0.1
 ```
 
-On first start the server prints a clickable URL like:
+First start prints a URL with a one-time bearer token (also saved to
+`~/.cc-map/token`):
 
 ```
-http://127.0.0.1:5781/?token=<long-hex>
+http://127.0.0.1:5781/?token=<hex>
 ```
 
-Open it. The token is also saved at `~/.cc-map/token` for re-use.
+Open it. The map loads with all your sessions.
 
-### Optional: wire the SessionStart hook
+## Layout modes
 
-Tells the viewer which session you're actively typing in. Without it, the viewer
-defaults to the most-recently-touched session, which is wrong when you have
-several Claude Code instances open.
+- **grid** — square-ish tree-map; fork siblings stack vertically
+- **column** — each session is a row; prompts go down, replies go right
+- **timeline** — one column per session, ordered by start time; Y axis is
+  *real wall-clock time* (with capped gaps so a week-long pause doesn't blow
+  up the canvas). Reveals burst sessions and idle days at a glance.
+
+## Node styles
+
+- **dots** — fast, good for overview
+- **cards** — text preview rendered in-place at variable height; click to
+  expand inline with full markdown + syntax highlighting
+
+## Color modes
+
+- **role** — user/assistant/subagent semantic colors
+- **recency** — zinc → emerald gradient (most recent activity glows)
+- **cost** — zinc → amber → red, mapped to assistant output tokens
+
+## Power features
+
+- **Live tip + follow live** — pulsing emerald dot on the active session's
+  latest message; off-screen arrow points to it when you've panned away;
+  optional auto-recenter as new messages arrive
+- **Spaces** — named workspaces grouping curated sessions; `Shift+drag` a
+  node onto a Space chip to add it
+- **Saved views** — snapshot `(scope, filter, visibility, layout, color)` and
+  recall by name; URL-shareable via hash encoding
+- **Command palette** (`Cmd/Ctrl+K`) — jump to any session, switch any mode,
+  apply any saved view, run any common action
+- **Search** — substring match with step-through (`Enter` / `Shift+Enter`),
+  recent searches dropdown, in-tooltip match highlighting
+- **Minimap** (top-right) — thumbnail with draggable viewport rectangle
+- **Bookmark gutter** (left edge) — amber stars at every bookmark's screen Y
+- **Multi-select** — `Ctrl/Cmd+click` to accumulate, then bulk bookmark or
+  add-to-Space from a floating toolbar
+- **Subagent collapse** — `+N subagents` badges on parents when sidechain
+  visibility is off; click to expand globally
+- **Animated mode transitions** — switching grid ↔ column ↔ timeline morphs
+  positions over 450ms so spatial relationships stay readable
+- **Daily activity heatmap** in the sidebar (last 5 weeks)
+
+## Sessions you spawn from the map
+
+Right-click any session band or node → context menu has:
+
+- **Resume in Windows Terminal** — opens `claude --resume <id>` in a new
+  terminal window
+- **Fork from this point** — opens `claude --fork-session <id>` (creates a
+  divergent branch)
+- **Add to Space**
+
+You can also spawn entirely new sessions inside a Space from the map (Phase 3c).
+
+## Architecture
+
+```
+packages/
+  parser/   Pure TS. Parses JSONL into a forest. DOM-free so it could run server-side later.
+  web/      React 19 + Vite 6 + Tailwind 4. Canvas 2D rendering (not SVG/pixi).
+apps/
+  server/   Fastify 5 on 127.0.0.1:5174. Bearer-token auth. SSE for live forest deltas.
+            Spawn endpoints. Watches ~/.claude/projects/ via chokidar.
+```
+
+### Quirks
+
+- **Windows chokidar** on appended files is flaky — `usePolling: true` plus a
+  2-second backstop poll in `packages/parser/src/watcher.ts` handles new files
+  AND grew-files reliably.
+- **`--fork-session`** creates cross-file shared messages with identical
+  uuids. The forest builder walks the raw stream BEFORE dedup so the adjacency
+  is correct.
+- **Active session** detection: server's `activeSessionId` is one-shot at
+  load; client recomputes from the latest-timestamp node on every forest
+  update, so it stays correct as you type.
+
+## Settings hook (optional)
+
+For more accurate active-session detection when you have multiple Claude Code
+instances open:
 
 ```sh
 npm run install-hook --workspace=@cc-map/server
 ```
 
-This adds an entry to `~/.claude/settings.json` that fires a fast POST to the
-local server on every Claude Code session start.
+Adds a SessionStart hook entry to `~/.claude/settings.json` that pings the
+local server when a Claude Code session starts.
 
-### Keyboard
+## Develop
 
-| Key | Action |
+```sh
+npm run dev                  # server + Vite (port 5174 by default)
+npm run dev:web              # web only (no server)
+npm run typecheck            # tsc -b in every workspace
+npm test                     # vitest (parser + web)
+npm run e2e --workspace=packages/web    # playwright smoke tests (after npx playwright install chromium)
+```
+
+Tests:
+
+- `packages/parser/test/*.test.ts` — 22 tests for jsonl parser + classifier
+- `packages/web/src/canvas/layout.test.ts` — 10 tests for buildLayout
+  (grid/column/timeline, fork stacking, subagent count, timeline gap clamping,
+  card height)
+- `packages/web/tests/smoke.spec.ts` — 7 Playwright smoke tests (need the dev
+  server running on 127.0.0.1:5174)
+
+## Keyboard shortcuts
+
+| Keys | Action |
 |---|---|
-| `j` / `k` | Next / previous chip |
-| `n` | Jump to next unread reply |
-| `/` | Focus the filter input |
+| `Cmd/Ctrl+K` | Open command palette |
+| `/` | Open search |
+| `Enter` / `Shift+Enter` | (in search) next / previous match |
+| `Alt+←` / `Alt+→` | Selection history back / forward |
+| `↑` `↓` `←` `→` | Cycle through visible nodes in the focused session |
+| `Space` | Jump to live tip |
+| `b` | Bookmark selected node |
+| `0` / `f` | Fit all |
+| `1` | Fit most-recent session |
+| `?` | Toggle help overlay |
+| `g v / g b / g s / g f / g l` | Gmail-style chord shortcuts |
+| `Shift+drag node` | Drag-to-Space gesture |
+| `Ctrl/Cmd+click` | Toggle node in multi-select |
 
-### Layout
+`?` in the app shows the full cheat sheet.
 
-```
-packages/
-  parser/   pure TS, DOM-free, parses Claude Code JSONL into a forest
-  web/      React + Vite UI (chip column + message pane; tree-map canvas in Phase 2)
-apps/
-  server/   Fastify on 127.0.0.1: serves UI, watches files, SessionStart hook endpoint
-```
+## License
+
+Private project. Not currently published.
