@@ -88,7 +88,7 @@ export function ChipColumn() {
               {stats.unreadAssistants} unread → next (n)
             </button>
           )}
-          <span className="ml-auto text-zinc-600">j/k = nav</span>
+          <span className="ml-auto text-zinc-500">j/k = nav</span>
         </div>
       </div>
       <div ref={listRef} className="flex-1 overflow-y-auto overflow-x-hidden">
@@ -165,7 +165,7 @@ function Chip({
             ⑂{chip.sharedWith.length}
           </span>
         )}
-        <span className="ml-auto text-zinc-600 text-xs">{(chip.contentLength / 1000).toFixed(1)}k</span>
+        <span className="ml-auto text-zinc-500 text-xs">{(chip.contentLength / 1000).toFixed(1)}k</span>
       </div>
       <div className="text-sm text-zinc-200 mt-1 line-clamp-3 leading-tight">
         {chip.preview || <span className="italic text-zinc-500">(empty)</span>}

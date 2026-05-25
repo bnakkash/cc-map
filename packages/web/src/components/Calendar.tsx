@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getToken } from "../api.js";
+import { prettySlug } from "../format.js";
 import type { ForestPayload } from "../canvas/types.js";
 
 interface Props {
@@ -17,6 +18,9 @@ interface Props {
 export function Calendar({ onSelectDay, onSelectSession }: Props) {
   const [forest, setForest] = useState<ForestPayload | null>(null);
   const [hoveredDay, setHoveredDay] = useState<string | null>(null);
+  // Clicking a day pins it so the session list below stays put and is
+  // clickable. Hover still previews (focusedDay falls back to hoveredDay).
+  const [selectedDay, setSelectedDay] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/forest", { headers: { Authorization: `Bearer ${getToken() ?? ""}` } })
@@ -106,8 +110,8 @@ export function Calendar({ onSelectDay, onSelectSession }: Props) {
     return "fill-emerald-300";
   };
 
-  // Selected day's sessions (when hovered or clicked)
-  const focusedDay = hoveredDay;
+  // Selected day's sessions (pinned click takes priority; hover previews)
+  const focusedDay = selectedDay ?? hoveredDay;
   const focusedSessions = useMemo(() => {
     if (!focusedDay || !forest) return [];
     const bucket = dayMap.get(focusedDay);
@@ -136,7 +140,7 @@ export function Calendar({ onSelectDay, onSelectSession }: Props) {
         <div className="mb-6">
           <h2 className="text-zinc-100 text-xl font-semibold">Activity (last 365 days)</h2>
           <p className="text-zinc-400 text-sm mt-1">
-            {totalPrompts.toLocaleString()} prompts across {totalDays} active days. Click a day to filter the map.
+            {totalPrompts.toLocaleString()} prompts across {totalDays} active days. Click a day to see its sessions.
           </p>
         </div>
 
@@ -179,11 +183,11 @@ export function Calendar({ onSelectDay, onSelectSession }: Props) {
                       width={cellSize}
                       height={cellSize}
                       rx={2}
-                      className={`${intensityClass(p)} ${p > 0 ? "cursor-pointer" : ""} ${hoveredDay === day.iso ? "stroke-emerald-300" : ""}`}
-                      strokeWidth={hoveredDay === day.iso ? 1.5 : 0}
+                      className={`${intensityClass(p)} ${p > 0 ? "cursor-pointer" : ""} ${hoveredDay === day.iso || selectedDay === day.iso ? "stroke-emerald-300" : ""}`}
+                      strokeWidth={hoveredDay === day.iso || selectedDay === day.iso ? 1.5 : 0}
                       onMouseEnter={() => setHoveredDay(day.iso)}
                       onMouseLeave={() => setHoveredDay(null)}
-                      onClick={() => p > 0 && onSelectDay(day.iso)}
+                      onClick={() => p > 0 && setSelectedDay(day.iso)}
                     >
                       <title>{`${day.iso}: ${p} prompt${p === 1 ? "" : "s"}${bucket ? `, ${bucket.sessions.size} session${bucket.sessions.size === 1 ? "" : "s"}` : ""}`}</title>
                     </rect>
@@ -208,9 +212,28 @@ export function Calendar({ onSelectDay, onSelectSession }: Props) {
         {/* Focused day detail */}
         {focusedDay && focusedSessions.length > 0 && (
           <div className="mt-8 border-t border-zinc-800 pt-6">
-            <h3 className="text-zinc-200 text-sm font-semibold mb-2">
-              {focusedDay} — {focusedSessions.length} session{focusedSessions.length === 1 ? "" : "s"}
-            </h3>
+            <div className="flex items-center gap-3 mb-2">
+              <h3 className="text-zinc-200 text-sm font-semibold">
+                {focusedDay} — {focusedSessions.length} session{focusedSessions.length === 1 ? "" : "s"}
+              </h3>
+              <button
+                onClick={() => onSelectDay(focusedDay)}
+                className="text-emerald-400 hover:text-emerald-300 text-xs"
+                title="Open the map filtered to this day"
+              >
+                View on map →
+              </button>
+              {selectedDay && (
+                <button
+                  onClick={() => setSelectedDay(null)}
+                  className="ml-auto text-zinc-500 hover:text-zinc-300 text-xs"
+                  aria-label="Clear selected day"
+                  title="Clear"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
             <div className="space-y-1">
               {focusedSessions.map((s) => (
                 <button
@@ -220,7 +243,7 @@ export function Calendar({ onSelectDay, onSelectSession }: Props) {
                 >
                   <span className="text-zinc-400">{s.promptsThisDay}p</span>
                   <span className="text-zinc-200 truncate">{s.title}</span>
-                  <span className="text-zinc-600 truncate ml-auto" title={s.projectSlug}>
+                  <span className="text-zinc-500 truncate ml-auto" title={s.projectSlug}>
                     {prettySlug(s.projectSlug)}
                   </span>
                 </button>
@@ -231,8 +254,4 @@ export function Calendar({ onSelectDay, onSelectSession }: Props) {
       </div>
     </div>
   );
-}
-
-function prettySlug(s: string): string {
-  return s.replace(/^C--Users-[^-]+-/, "~/").replace(/-+/g, "/");
 }

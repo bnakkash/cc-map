@@ -77,6 +77,9 @@ export function CommandPalette({ open, items, onClose }: CommandPaletteProps) {
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
         className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl w-full max-w-xl flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >

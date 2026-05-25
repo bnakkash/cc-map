@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { prettySlug } from "../format.js";
 import { useStore } from "../store.js";
 
 export function SessionPicker() {
@@ -28,7 +29,7 @@ export function SessionPicker() {
         Select session…
       </option>
       {grouped.map(([project, list]) => (
-        <optgroup key={project} label={prettyProject(project)}>
+        <optgroup key={project} label={prettySlug(project)}>
           {list.map((s) => (
             <option key={s.sessionId} value={s.sessionId}>
               {s.sessionId.slice(0, 8)} · {prettyTime(s.lastActivityAt)} · {s.promptCount}p / {s.nodeCount}n
@@ -39,13 +40,6 @@ export function SessionPicker() {
       ))}
     </select>
   );
-}
-
-function prettyProject(slug: string): string {
-  // C--Users-bnakk-OneDrive-Project-Phoenix → ~/OneDrive/Project Phoenix
-  return slug
-    .replace(/^C--Users-[^-]+-/, "~/")
-    .replace(/-+/g, "/");
 }
 
 function prettyTime(ts: string | null): string {

@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { api, type NodeResponse } from "../api.js";
 import { useStore } from "../store.js";
+
+// Reuse the map's renderer (react-markdown + rehype-highlight). Lazy so the
+// highlight.js bundle only loads once a message is actually opened.
+const ContentRender = lazy(() => import("./ContentRender.js"));
 
 export function MessagePane() {
   const sessionId = useStore((s) => s.selectedSessionId);
@@ -40,10 +42,10 @@ export function MessagePane() {
 
   if (!nodeId) {
     return (
-      <div className="flex-1 flex items-center justify-center text-zinc-600 text-sm">
+      <div className="flex-1 flex items-center justify-center text-zinc-400 text-sm">
         Click a chip on the left to read the message.
         <br />
-        Hint: <kbd className="px-1 mx-1 bg-zinc-800 rounded">n</kbd> jumps to next unread reply.
+        Hint: <kbd className="px-1 mx-1 bg-zinc-800 rounded text-zinc-300">n</kbd> jumps to next unread reply.
       </div>
     );
   }
@@ -55,15 +57,14 @@ export function MessagePane() {
   }
   if (!data) return null;
 
-  const raw = data.raw as { message?: { content?: unknown } } | null;
-  const content = raw?.message?.content;
-
   return (
     <div className="flex-1 overflow-y-auto bg-zinc-950">
       <div className="max-w-4xl mx-auto px-6 py-6">
         <Header data={data} />
-        <div className="mt-4 md-body text-zinc-200">
-          <ContentRender content={content} />
+        <div className="mt-4">
+          <Suspense fallback={<div className="text-zinc-500 italic">loading renderer…</div>}>
+            <ContentRender data={data} />
+          </Suspense>
         </div>
       </div>
     </div>
@@ -84,65 +85,4 @@ function Header({ data }: { data: NodeResponse }) {
       <span className="ml-auto text-zinc-600">{node.id.slice(0, 8)}</span>
     </div>
   );
-}
-
-function ContentRender({ content }: { content: unknown }) {
-  if (typeof content === "string") {
-    return (
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
-    );
-  }
-  if (Array.isArray(content)) {
-    return (
-      <div className="space-y-3">
-        {content.map((block, i) => (
-          <BlockRender key={i} block={block} />
-        ))}
-      </div>
-    );
-  }
-  return <div className="text-zinc-500 italic">(empty)</div>;
-}
-
-function BlockRender({ block }: { block: unknown }) {
-  if (!block || typeof block !== "object") {
-    return <pre className="text-xs text-zinc-500">{JSON.stringify(block, null, 2)}</pre>;
-  }
-  const b = block as { type?: string; text?: string; name?: string; input?: unknown; content?: unknown; tool_use_id?: string };
-  if (b.type === "text" && typeof b.text === "string") {
-    return <ReactMarkdown remarkPlugins={[remarkGfm]}>{b.text}</ReactMarkdown>;
-  }
-  if (b.type === "tool_use") {
-    return (
-      <details className="border border-blue-900/50 bg-blue-950/20 rounded p-2 text-sm">
-        <summary className="cursor-pointer text-blue-400 font-mono">
-          🔧 {b.name ?? "tool"}
-        </summary>
-        <pre className="mt-2 text-xs overflow-x-auto text-blue-200">
-          {JSON.stringify(b.input, null, 2)}
-        </pre>
-      </details>
-    );
-  }
-  if (b.type === "tool_result") {
-    const text =
-      typeof b.content === "string"
-        ? b.content
-        : Array.isArray(b.content)
-          ? b.content
-              .map((c) => (c && typeof c === "object" && "text" in c ? String((c as { text: unknown }).text) : ""))
-              .join("\n")
-          : "";
-    return (
-      <details className="border border-zinc-800 bg-zinc-900/40 rounded p-2 text-sm">
-        <summary className="cursor-pointer text-zinc-400 font-mono">
-          📨 tool_result
-        </summary>
-        <pre className="mt-2 text-xs overflow-x-auto whitespace-pre-wrap text-zinc-300">
-          {text}
-        </pre>
-      </details>
-    );
-  }
-  return <pre className="text-xs text-zinc-500">{JSON.stringify(block, null, 2)}</pre>;
 }

@@ -10,6 +10,12 @@ import { useStore } from "./store.js";
 
 type ViewName = "viewer" | "map" | "calendar";
 
+const VIEW_DESC: Record<ViewName, string> = {
+  viewer: "read one session's prompts & replies",
+  map: "pan & zoom every session as a forest",
+  calendar: "daily activity heatmap",
+};
+
 export default function App() {
   const loadSessions = useStore((s) => s.loadSessions);
   const pushDeltaChips = useStore((s) => s.pushDeltaChips);
@@ -70,30 +76,24 @@ export default function App() {
     <div className="h-full flex flex-col">
       <header className="border-b border-zinc-800 bg-zinc-900/50 px-4 py-2 flex items-center gap-4">
         <div className="font-mono text-sm font-semibold text-zinc-300">cc-map</div>
-        <div className="flex gap-1">
-          <button
-            onClick={() => setView("viewer")}
-            className={`px-2 py-1 rounded text-xs ${view === "viewer" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
-          >
-            viewer
-          </button>
-          <button
-            onClick={() => setView("map")}
-            className={`px-2 py-1 rounded text-xs ${view === "map" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
-          >
-            map
-          </button>
-          <button
-            onClick={() => setView("calendar")}
-            className={`px-2 py-1 rounded text-xs ${view === "calendar" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
-          >
-            calendar
-          </button>
+        <div className="flex gap-1" role="tablist" aria-label="View">
+          {(["viewer", "map", "calendar"] as const).map((v) => (
+            <button
+              key={v}
+              role="tab"
+              aria-selected={view === v}
+              onClick={() => setView(v)}
+              title={VIEW_DESC[v]}
+              className={`px-2 py-1 rounded text-xs ${view === v ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+            >
+              {v}
+            </button>
+          ))}
         </div>
         {view === "viewer" && <SessionPicker />}
         <div className="ml-auto text-xs text-zinc-500">
           {error && <span className="text-red-400 mr-3">{error}</span>}
-          {view === "viewer" ? "phase 1 · viewer" : view === "map" ? "phase 2 · tree-map" : "phase 3 · calendar"}
+          {VIEW_DESC[view]}
         </div>
       </header>
       <main className="flex-1 flex overflow-hidden">

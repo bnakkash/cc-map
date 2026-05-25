@@ -108,6 +108,7 @@ export function BookmarkGutter({
             fontSize: STAR_SIZE,
           }}
           title={d.preview ? `★ ${d.preview.slice(0, 80)}` : "★ bookmark"}
+          aria-label={d.preview ? `Bookmark: ${d.preview.slice(0, 80)}` : "Bookmark"}
           onClick={() => {
             onSelect(d.id);
             panToLayoutPoint(d.lx, d.ly);
