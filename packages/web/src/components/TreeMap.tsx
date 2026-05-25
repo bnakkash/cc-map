@@ -21,6 +21,7 @@ import {
   render,
 } from "../canvas/renderer.js";
 import { buildColorContext, projectColor } from "../canvas/colors.js";
+import { prettySlug } from "../format.js";
 import { Minimap } from "./Minimap.js";
 import { BookmarkGutter } from "./BookmarkGutter.js";
 import { CommandPalette, type PaletteItem } from "./CommandPalette.js";
@@ -123,6 +124,24 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     | { mode: "new"; cwd: string; prompt: string; targetSpaceId: string | null }
     | { mode: "continue"; sessionId: string; cwd: string; prompt: string }
   >(null);
+
+  // In-app replacements for window.prompt / window.confirm / alert so naming a
+  // Space, confirming a delete, or surfacing an error doesn't fire a jarring,
+  // unstyled native dialog that blocks the whole tab.
+  const [textPrompt, setTextPrompt] = useState<
+    | null
+    | { title: string; label?: string; initial: string; placeholder?: string; confirmLabel?: string; onSubmit: (value: string) => void }
+  >(null);
+  const [confirmDialog, setConfirmDialog] = useState<
+    | null
+    | { title: string; message: string; confirmLabel?: string; danger?: boolean; onConfirm: () => void }
+  >(null);
+  const [toast, setToast] = useState<{ id: number; message: string; kind: "error" | "info" } | null>(null);
+  const showToast = useCallback((message: string, kind: "error" | "info" = "info") => {
+    const id = Date.now();
+    setToast({ id, message, kind });
+    window.setTimeout(() => setToast((t) => (t && t.id === id ? null : t)), 5000);
+  }, []);
 
   // ───── Spaces (top-level workspaces) ─────
   // A Space is a curated subset of the forest. Switching INTO a space filters
@@ -244,7 +263,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       });
       const j = (await r.json()) as { ok?: boolean; sessionId?: string; error?: string };
       if (!r.ok || !j.ok) {
-        alert(`Spawn failed: ${j.error ?? r.statusText}`);
+        showToast(`Spawn failed: ${j.error ?? r.statusText}`, "error");
         return;
       }
       // For "new" mode: add session to space + transition modal to "continue" mode
@@ -265,9 +284,9 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         setSpawnModal({ ...spawnModal, prompt: "" });
       }
     } catch (e) {
-      alert(`Spawn failed: ${e}`);
+      showToast(`Spawn failed: ${e}`, "error");
     }
-  }, [spawnModal, addSessionToSpace]);
+  }, [spawnModal, addSessionToSpace, showToast]);
 
   // ───── Bookmarks (per-uuid) ─────
   const [bookmarks, setBookmarks] = useState<Set<string>>(() => {
@@ -1466,6 +1485,12 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         if (e.key === "Escape") (document.activeElement as HTMLElement).blur();
         return;
       }
+      // A modal is open: it owns the keyboard (Esc/Tab handled by useDialog).
+      // Bail so map shortcuts (f, 0, 1, …) don't fire behind the overlay.
+      if (welcomeOpen || helpOpen || spawnModal || textPrompt || confirmDialog) {
+        if (helpOpen && e.key === "?") setHelpOpen(false); // keep ?-toggles-help
+        return;
+      }
       // Alt+left/right = browser-style selection history (back/forward).
       // Takes priority over the plain arrow-key navigation so the modifier
       // version doesn't fall through to "cycle within session."
@@ -1615,7 +1640,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [layout, size, forest, selected, helpOpen, searchOpen, onClose, effectiveActiveSession, liveTipId, mode, scopeProject, toggleBookmark, multiSelected, navigateHistory]);
+  }, [layout, size, forest, selected, helpOpen, searchOpen, onClose, effectiveActiveSession, liveTipId, mode, scopeProject, toggleBookmark, multiSelected, navigateHistory, welcomeOpen, spawnModal, textPrompt, confirmDialog]);
 
   // ───── Tooltip data ─────
   // Enriched in timeline mode with gap-from-prev; assistant nodes include
@@ -1670,6 +1695,16 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       };
     }
   }, [hovered, forest, layout]);
+
+  // Mark the welcome modal as seen + close it (shared by Esc / backdrop / button).
+  const closeWelcome = useCallback(() => {
+    setWelcomeOpen(false);
+    try { localStorage.setItem("cc-map-seen-welcome", "1"); } catch {}
+  }, []);
+  // Focus management + Esc handling for the inline modals (Welcome/Help/Spawn).
+  const welcomeDialogRef = useDialog(welcomeOpen, closeWelcome);
+  const helpDialogRef = useDialog(helpOpen, () => setHelpOpen(false));
+  const spawnDialogRef = useDialog(!!spawnModal, () => setSpawnModal(null));
 
   if (error) {
     return <div className="flex-1 flex items-center justify-center text-red-400">{error}</div>;
@@ -1767,18 +1802,26 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             <span className="text-zinc-500 text-xs">Spaces</span>
             <button
               onClick={() => {
-                const name = window.prompt("Name this space:", "Untitled");
-                if (!name) return;
-                const sp: Space = {
-                  id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `s_${Date.now()}`,
-                  name,
-                  hue: Math.floor(Math.random() * 360),
-                  sessionIds: [],
-                  note: "",
-                  createdAt: new Date().toISOString(),
-                };
-                upsertSpace(sp);
-                setActiveSpaceId(sp.id);
+                setTextPrompt({
+                  title: "New space",
+                  label: "Name",
+                  initial: "Untitled",
+                  confirmLabel: "Create",
+                  onSubmit: (raw) => {
+                    const name = raw.trim();
+                    if (!name) return;
+                    const sp: Space = {
+                      id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `s_${Date.now()}`,
+                      name,
+                      hue: Math.floor(Math.random() * 360),
+                      sessionIds: [],
+                      note: "",
+                      createdAt: new Date().toISOString(),
+                    };
+                    upsertSpace(sp);
+                    setActiveSpaceId(sp.id);
+                  },
+                });
               }}
               className="text-zinc-400 hover:text-zinc-200 text-xs"
               title="new space"
@@ -1809,23 +1852,36 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                 </button>
                 <button
                   onClick={() => {
-                    const newName = window.prompt("Rename:", sp.name);
-                    if (newName == null) return;
-                    upsertSpace({ ...sp, name: newName });
+                    setTextPrompt({
+                      title: "Rename space",
+                      label: "Name",
+                      initial: sp.name,
+                      confirmLabel: "Rename",
+                      onSubmit: (raw) => {
+                        const name = raw.trim();
+                        if (name) upsertSpace({ ...sp, name });
+                      },
+                    });
                   }}
                   className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-zinc-200 text-xs px-0.5"
                   title="rename"
+                  aria-label={`Rename space ${sp.name}`}
                 >
                   ✎
                 </button>
                 <button
                   onClick={() => {
-                    if (window.confirm(`Delete space "${sp.name}"? (member sessions stay; only the grouping is removed)`)) {
-                      deleteSpace(sp.id);
-                    }
+                    setConfirmDialog({
+                      title: "Delete space",
+                      message: `Delete space "${sp.name}"? Member sessions stay — only the grouping is removed.`,
+                      confirmLabel: "Delete",
+                      danger: true,
+                      onConfirm: () => deleteSpace(sp.id),
+                    });
                   }}
                   className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-400 text-xs px-0.5"
                   title="delete"
+                  aria-label={`Delete space ${sp.name}`}
                 >
                   ✕
                 </button>
@@ -2121,20 +2177,29 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               <span className="text-zinc-500 text-xs">Views ({savedViews.length})</span>
               <button
                 onClick={() => {
-                  const name = window.prompt("Name this view:", "");
-                  if (!name) return;
-                  const view: SavedView = {
-                    id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `v_${Date.now()}`,
-                    name,
-                    mode,
-                    scopeProject,
-                    filter,
-                    visibility,
-                    nodeStyle,
-                    direction,
-                    colorMode,
-                  };
-                  persistViews([...savedViews, view]);
+                  setTextPrompt({
+                    title: "Save view",
+                    label: "Name",
+                    initial: "",
+                    placeholder: "e.g. cost heatmap",
+                    confirmLabel: "Save",
+                    onSubmit: (raw) => {
+                      const name = raw.trim();
+                      if (!name) return;
+                      const view: SavedView = {
+                        id: typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `v_${Date.now()}`,
+                        name,
+                        mode,
+                        scopeProject,
+                        filter,
+                        visibility,
+                        nodeStyle,
+                        direction,
+                        colorMode,
+                      };
+                      persistViews([...savedViews, view]);
+                    },
+                  });
                 }}
                 className="text-zinc-400 hover:text-zinc-200 text-xs px-1.5 py-0.5 rounded bg-zinc-900 hover:bg-zinc-800"
                 title="Save the current map state (filters, scope, layout, colors) as a named view"
@@ -2165,12 +2230,17 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                     </button>
                     <button
                       onClick={() => {
-                        if (window.confirm(`Delete view "${v.name}"?`)) {
-                          persistViews(savedViews.filter((x) => x.id !== v.id));
-                        }
+                        setConfirmDialog({
+                          title: "Delete view",
+                          message: `Delete view "${v.name}"?`,
+                          confirmLabel: "Delete",
+                          danger: true,
+                          onConfirm: () => persistViews(savedViews.filter((x) => x.id !== v.id)),
+                        });
                       }}
                       className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-400 text-xs px-1"
                       title="Delete view"
+                      aria-label={`Delete view ${v.name}`}
                     >
                       ×
                     </button>
@@ -2379,6 +2449,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                   className="text-zinc-400 hover:text-zinc-100 text-xs px-1.5 rounded hover:bg-zinc-800"
                   onClick={() => stepMatch(-1)}
                   title="Previous match (shift+enter)"
+                  aria-label="Previous match"
                 >
                   ↑
                 </button>
@@ -2389,6 +2460,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                   className="text-zinc-400 hover:text-zinc-100 text-xs px-1.5 rounded hover:bg-zinc-800"
                   onClick={() => stepMatch(1)}
                   title="Next match (enter)"
+                  aria-label="Next match"
                 >
                   ↓
                 </button>
@@ -2421,6 +2493,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               className="text-zinc-500 hover:text-zinc-200 text-xs px-1"
               onClick={() => { setSearchOpen(false); setSearchQuery(""); }}
               title="esc"
+              aria-label="Close search"
             >
               ✕
             </button>
@@ -2774,10 +2847,10 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                 .then((r) => {
                   if (!r.ok && r.command) {
                     void navigator.clipboard.writeText(r.command);
-                    alert(`Manual launch needed.\nCommand copied to clipboard:\n  ${r.command}`);
+                    showToast(`Couldn't launch a terminal — command copied to clipboard: ${r.command}`, "error");
                   }
                 })
-                .catch((e) => alert(`Resume failed: ${e}`));
+                .catch((e) => showToast(`Resume failed: ${e}`, "error"));
             }}
             isBookmarked={contextMenu.target.kind === "node" && contextMenu.target.id ? bookmarks.has(contextMenu.target.id) : false}
             onToggleBookmark={(id) => toggleBookmark(id)}
@@ -2800,7 +2873,13 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             className="absolute inset-0 z-40 bg-zinc-950/80 backdrop-blur flex items-center justify-center"
             onClick={(e) => { if (e.target === e.currentTarget) setSpawnModal(null); }}
           >
-            <div className="bg-zinc-900 border border-zinc-700 rounded-lg p-5 max-w-2xl w-full text-sm space-y-3 max-h-[85vh] flex flex-col">
+            <div
+              ref={spawnDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-label={spawnModal.mode === "new" ? "New Claude Code session" : "Chat with session"}
+              className="bg-zinc-900 border border-zinc-700 rounded-lg p-5 max-w-2xl w-full text-sm space-y-3 max-h-[85vh] flex flex-col outline-none"
+            >
               <div className="flex items-center justify-between">
                 <div className="text-zinc-100 font-semibold text-base">
                   {spawnModal.mode === "new" ? "✦ New Claude Code session" : "✦ Chat with session"}
@@ -2809,6 +2888,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                   onClick={() => setSpawnModal(null)}
                   className="text-zinc-500 hover:text-zinc-200 text-base leading-none"
                   title="close (esc)"
+                  aria-label="Close"
                 >
                   ✕
                 </button>
@@ -2908,7 +2988,12 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           onClick={() => setHelpOpen(false)}
         >
           <div
-            className="bg-zinc-900 border border-zinc-700 rounded-lg p-6 max-w-2xl text-sm grid grid-cols-2 gap-x-8 gap-y-3 max-h-[85vh] overflow-y-auto"
+            ref={helpDialogRef}
+            tabIndex={-1}
+            role="dialog"
+            aria-modal="true"
+            aria-label="cc-map controls"
+            className="bg-zinc-900 border border-zinc-700 rounded-lg p-6 max-w-2xl text-sm grid grid-cols-2 gap-x-8 gap-y-3 max-h-[85vh] overflow-y-auto outline-none"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="col-span-2 text-zinc-100 font-semibold text-base mb-1">cc-map — controls</div>
@@ -2993,10 +3078,15 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       {welcomeOpen && (
         <div
           className="absolute inset-0 z-50 bg-zinc-950/80 backdrop-blur flex items-center justify-center"
-          onClick={() => { setWelcomeOpen(false); try { localStorage.setItem("cc-map-seen-welcome", "1"); } catch {} }}
+          onClick={closeWelcome}
         >
           <div
-            className="bg-zinc-900 border border-zinc-700 rounded-lg p-6 max-w-lg space-y-4 shadow-2xl"
+            ref={welcomeDialogRef}
+            tabIndex={-1}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Welcome to cc-map"
+            className="bg-zinc-900 border border-zinc-700 rounded-lg p-6 max-w-lg space-y-4 shadow-2xl outline-none"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="text-zinc-100 font-semibold text-xl">Welcome to cc-map</div>
@@ -3032,7 +3122,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             <div className="flex justify-end gap-2 pt-2">
               <button
                 className="px-4 py-2 rounded bg-emerald-700 hover:bg-emerald-600 text-white text-sm"
-                onClick={() => { setWelcomeOpen(false); try { localStorage.setItem("cc-map-seen-welcome", "1"); } catch {} }}
+                onClick={closeWelcome}
               >
                 Got it
               </button>
@@ -3048,6 +3138,39 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           style={{ left: dragSession.x + 12, top: dragSession.y + 12 }}
         >
           → {dragSession.label}
+        </div>
+      )}
+
+      {/* In-app prompt / confirm (replace native dialogs) */}
+      {textPrompt && (
+        <TextPromptModal {...textPrompt} onClose={() => setTextPrompt(null)} />
+      )}
+      {confirmDialog && (
+        <ConfirmModal {...confirmDialog} onClose={() => setConfirmDialog(null)} />
+      )}
+
+      {/* Transient toast (replaces alert()) */}
+      {toast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`absolute top-3 left-1/2 -translate-x-1/2 z-50 max-w-md px-3 py-2 rounded shadow-xl text-xs backdrop-blur border ${
+            toast.kind === "error"
+              ? "bg-red-950/90 border-red-800 text-red-200"
+              : "bg-zinc-900/95 border-zinc-700 text-zinc-200"
+          }`}
+        >
+          <div className="flex items-start gap-2">
+            <span className="break-words">{toast.message}</span>
+            <button
+              onClick={() => setToast(null)}
+              className="shrink-0 text-current opacity-60 hover:opacity-100"
+              aria-label="Dismiss"
+              title="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
         </div>
       )}
     </div>
@@ -3105,6 +3228,167 @@ function SidebarGroup({
         )}
       </button>
       {open && <div className="space-y-2 mt-1">{children}</div>}
+    </div>
+  );
+}
+
+// ───── Modal a11y ─────
+/**
+ * Wire up the keyboard + focus contract every modal should honor: focus moves
+ * inside on open (unless a child already grabbed it, e.g. an autoFocus field),
+ * Tab is trapped within the dialog, Esc closes, and focus is restored to
+ * whatever was focused before. Returns a ref to attach to the dialog container.
+ *
+ * The keydown listener runs in the capture phase and stops propagation, so the
+ * map's global shortcut handler never sees Esc/Tab while a modal is up.
+ */
+function useDialog(open: boolean, onClose: () => void) {
+  const ref = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const prev = document.activeElement as HTMLElement | null;
+    const el = ref.current;
+    const FOCUSABLE = 'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
+    if (el && !el.contains(document.activeElement)) {
+      const first = el.querySelector<HTMLElement>(FOCUSABLE);
+      (first ?? el).focus();
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        closeRef.current();
+        return;
+      }
+      if (e.key === "Tab" && el) {
+        const items = [...el.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((x) => x.offsetParent !== null);
+        if (items.length === 0) return;
+        const first = items[0]!;
+        const last = items[items.length - 1]!;
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("keydown", onKey, true);
+      prev?.focus?.();
+    };
+  }, [open]);
+  return ref;
+}
+
+/** Styled in-app replacement for window.prompt. */
+function TextPromptModal({
+  title,
+  label,
+  initial,
+  placeholder,
+  confirmLabel = "OK",
+  onSubmit,
+  onClose,
+}: {
+  title: string;
+  label?: string;
+  initial: string;
+  placeholder?: string;
+  confirmLabel?: string;
+  onSubmit: (value: string) => void;
+  onClose: () => void;
+}) {
+  const [value, setValue] = useState(initial);
+  const dialogRef = useDialog(true, onClose);
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+  const submit = () => { onSubmit(value); onClose(); };
+  return (
+    <div
+      className="absolute inset-0 z-50 bg-zinc-950/80 backdrop-blur flex items-center justify-center"
+      onClick={onClose}
+    >
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        className="bg-zinc-900 border border-zinc-700 rounded-lg p-5 w-full max-w-sm space-y-3 shadow-2xl outline-none"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="text-zinc-100 font-semibold">{title}</div>
+        {label && <label className="block text-xs text-zinc-400">{label}</label>}
+        <input
+          ref={inputRef}
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") { e.preventDefault(); submit(); }
+          }}
+          className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1.5 text-zinc-100 text-sm"
+        />
+        <div className="flex justify-end gap-2 pt-1">
+          <button onClick={onClose} className="px-3 py-1 text-xs text-zinc-400 hover:text-zinc-200">Cancel</button>
+          <button onClick={submit} className="px-3 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 rounded text-white">{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Styled in-app replacement for window.confirm. */
+function ConfirmModal({
+  title,
+  message,
+  confirmLabel = "OK",
+  danger = false,
+  onConfirm,
+  onClose,
+}: {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  danger?: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const dialogRef = useDialog(true, onClose);
+  return (
+    <div
+      className="absolute inset-0 z-50 bg-zinc-950/80 backdrop-blur flex items-center justify-center"
+      onClick={onClose}
+    >
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        className="bg-zinc-900 border border-zinc-700 rounded-lg p-5 w-full max-w-sm space-y-3 shadow-2xl outline-none"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="text-zinc-100 font-semibold">{title}</div>
+        <div className="text-sm text-zinc-300 leading-relaxed">{message}</div>
+        <div className="flex justify-end gap-2 pt-1">
+          <button onClick={onClose} className="px-3 py-1 text-xs text-zinc-400 hover:text-zinc-200">Cancel</button>
+          <button
+            onClick={() => { onConfirm(); onClose(); }}
+            className={`px-3 py-1 text-xs rounded text-white ${danger ? "bg-red-700 hover:bg-red-600" : "bg-emerald-700 hover:bg-emerald-600"}`}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -3178,10 +3462,6 @@ function easeOutCubic(t: number): number {
   return 1 - Math.pow(1 - t, 3);
 }
 
-function prettySlug(s: string): string {
-  return s.replace(/^C--Users-[^-]+-/, "~/").replace(/-+/g, "/");
-}
-
 function mostRecentSessionBand(layout: Layout, forest: ForestPayload) {
   // Find the session in scope whose latest timestamp is newest, then return its band.
   const byId = new Map<string, string>(); // sessionId -> latest timestamp
@@ -3225,9 +3505,9 @@ function ZoomOverlay({
   void size;
   return (
     <div className="absolute bottom-3 left-3 z-10 flex items-center gap-1 bg-zinc-900/85 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-300 font-mono backdrop-blur">
-      <button className="px-1.5 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700" onClick={() => onZoomChange(1 / 1.5)} title="−">−</button>
+      <button className="px-1.5 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700" onClick={() => onZoomChange(1 / 1.5)} title="−" aria-label="Zoom out">−</button>
       <span className="w-12 text-center">{(t.scale * 100).toFixed(0)}%</span>
-      <button className="px-1.5 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700" onClick={() => onZoomChange(1.5)} title="=">+</button>
+      <button className="px-1.5 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700" onClick={() => onZoomChange(1.5)} title="=" aria-label="Zoom in">+</button>
       <button className="px-2 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700 ml-2" onClick={onFitRecent} title="1">recent</button>
       <button className="px-2 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700" onClick={onFitAll} title="0 / f">all</button>
     </div>
@@ -3524,6 +3804,7 @@ function InlineCardExpand({
             onClick={pinned ? onUnpin : onPin}
             className={`w-6 h-6 rounded text-base leading-none ${pinned ? "text-amber-400 hover:text-amber-200 hover:bg-zinc-800" : "text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800"}`}
             title={pinned ? "Unpin (let selection update this panel)" : "Pin this card open"}
+            aria-label={pinned ? "Unpin card" : "Pin card open"}
           >
             {pinned ? "📌" : "📍"}
           </button>
@@ -3531,6 +3812,7 @@ function InlineCardExpand({
             onClick={onClose}
             className="w-6 h-6 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 text-lg leading-none"
             title="Close (Esc)"
+            aria-label="Close card"
           >
             ×
           </button>
@@ -3606,6 +3888,7 @@ function DetailPanel({
           disabled={!prevId}
           className="px-2 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700 disabled:opacity-30 disabled:hover:bg-zinc-800"
           title="prev in session"
+          aria-label="Previous message in session"
         >
           ←
         </button>
@@ -3614,12 +3897,13 @@ function DetailPanel({
           disabled={!nextId}
           className="px-2 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700 disabled:opacity-30 disabled:hover:bg-zinc-800"
           title="next in session"
+          aria-label="Next message in session"
         >
           →
         </button>
         <span className="text-zinc-600">message</span>
         <span className="text-zinc-400 font-mono truncate" title={selectedId}>{selectedId.slice(0, 8)}</span>
-        <button onClick={onClose} className="ml-auto text-zinc-500 hover:text-zinc-300 text-base leading-none" title="esc">✕</button>
+        <button onClick={onClose} className="ml-auto text-zinc-500 hover:text-zinc-300 text-base leading-none" title="esc" aria-label="Close detail panel">✕</button>
       </div>
       {node && (
         <div className="px-3 py-2 border-b border-zinc-800 text-xs space-y-1">

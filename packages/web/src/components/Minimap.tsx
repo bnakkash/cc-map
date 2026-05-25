@@ -190,6 +190,7 @@ export function Minimap({
             onClick={() => setCollapsed(true)}
             className="absolute top-1 right-1 w-5 h-5 rounded bg-zinc-900/80 border border-zinc-700 text-zinc-400 text-xs leading-none hover:bg-zinc-800"
             title="Hide minimap"
+            aria-label="Hide minimap"
           >
             ×
           </button>

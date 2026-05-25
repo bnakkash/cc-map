@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getToken } from "../api.js";
+import { prettySlug } from "../format.js";
 import type { ForestPayload } from "../canvas/types.js";
 
 interface Props {
@@ -242,7 +243,7 @@ export function Calendar({ onSelectDay, onSelectSession }: Props) {
                 >
                   <span className="text-zinc-400">{s.promptsThisDay}p</span>
                   <span className="text-zinc-200 truncate">{s.title}</span>
-                  <span className="text-zinc-600 truncate ml-auto" title={s.projectSlug}>
+                  <span className="text-zinc-500 truncate ml-auto" title={s.projectSlug}>
                     {prettySlug(s.projectSlug)}
                   </span>
                 </button>
@@ -253,8 +254,4 @@ export function Calendar({ onSelectDay, onSelectSession }: Props) {
       </div>
     </div>
   );
-}
-
-function prettySlug(s: string): string {
-  return s.replace(/^C--Users-[^-]+-/, "~/").replace(/-+/g, "/");
 }
