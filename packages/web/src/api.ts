@@ -1,3 +1,5 @@
+import type { ForestPayload, SessionTokens } from "./canvas/types.js";
+
 // Shared API types kept in sync with @cc-map/server. Could be a shared package later.
 
 export interface SessionListItem {
@@ -8,6 +10,10 @@ export interface SessionListItem {
   promptCount: number;
   startedAt: string | null;
   lastActivityAt: string | null;
+  aiTitle: string | null;
+  firstPrompt: string | null;
+  tokens: SessionTokens;
+  toolsUsed: string[];
 }
 
 export interface ActiveSessionInfo {
@@ -98,8 +104,39 @@ async function get<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+let forestCache: ForestPayload | null = null;
+let forestPromise: Promise<ForestPayload> | null = null;
+
+export function setForestCache(
+  next: ForestPayload | null | ((prev: ForestPayload | null) => ForestPayload | null),
+): ForestPayload | null {
+  forestCache = typeof next === "function" ? next(forestCache) : next;
+  if (forestCache === null) forestPromise = null;
+  return forestCache;
+}
+
+export function clearForestCache() {
+  forestCache = null;
+  forestPromise = null;
+}
+
 export const api = {
   sessions: () => get<SessionsResponse>("/api/sessions"),
+  forest: ({ force = false }: { force?: boolean } = {}) => {
+    if (!force && forestCache) return Promise.resolve(forestCache);
+    if (!force && forestPromise) return forestPromise;
+    forestPromise = get<ForestPayload>("/api/forest")
+      .then((payload) => {
+        forestCache = payload;
+        forestPromise = null;
+        return payload;
+      })
+      .catch((err) => {
+        forestPromise = null;
+        throw err;
+      });
+    return forestPromise;
+  },
   chips: (sessionId: string) => get<ChipsResponse>(`/api/sessions/${sessionId}/chips`),
   node: (sessionId: string, uuid: string) =>
     get<NodeResponse>(`/api/sessions/${sessionId}/nodes/${uuid}`),

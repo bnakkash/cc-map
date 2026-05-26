@@ -14,13 +14,13 @@ const STEPS: TourStep[] = [
   {
     id: "welcome",
     title: "Welcome to cc-map",
-    body: "A 2D map of every Claude Code session. This quick tour shows the 4 things you'll use most.",
+    body: "Start with the map. These notes point out the controls that make a large session history easier to scan.",
     target: "center",
   },
   {
     id: "sidebar",
     title: "Sidebar",
-    body: "Six collapsible groups: Scope, Display, Live, Filter, Saved, Activity. Use the chevron to fold sections you don't need — collapsed groups still show their current setting.",
+    body: "Scope and Display are the main controls. Filters, saved views, and activity can stay collapsed until you need them.",
     target: "[data-tour-id='sidebar']",
     placement: "right",
   },
@@ -41,7 +41,7 @@ const STEPS: TourStep[] = [
   {
     id: "palette",
     title: "Command palette",
-    body: "Press Cmd/Ctrl+K from anywhere to jump to a session, switch modes, or run actions. The fastest way to navigate once you have a few sessions.",
+    body: "Press Cmd/Ctrl+K to jump to a session, switch modes, or run actions. It is the fastest way around a large map.",
     target: "center",
   },
 ];
@@ -155,8 +155,8 @@ export function OnboardingTour({ open, onClose }: OnboardingTourProps) {
 
   return (
     <div className="absolute inset-0 z-50 pointer-events-none">
-      {/* Dim overlay with cutout around the highlighted element */}
-      <div className="absolute inset-0 bg-zinc-950/60 backdrop-blur-[2px] pointer-events-auto" onClick={advance} />
+      {/* Non-blocking dim layer: the app remains usable while the tour is open. */}
+      <div className="absolute inset-0 bg-zinc-950/25 backdrop-blur-[1px] pointer-events-none" />
       {/* Highlight ring */}
       {highlight && (
         <div

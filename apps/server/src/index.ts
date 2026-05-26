@@ -139,6 +139,14 @@ fastify.get("/api/forest", async () => {
 });
 
 fastify.get("/api/sessions", async () => {
+  const firstPromptBySession = new Map<string, { ts: string; preview: string }>();
+  for (const n of state.forest.nodes.values()) {
+    if (n.classification.role !== "user" || n.classification.subtype !== "prompt") continue;
+    const cur = firstPromptBySession.get(n.sessionId);
+    if (!cur || n.timestamp < cur.ts) {
+      firstPromptBySession.set(n.sessionId, { ts: n.timestamp, preview: n.preview });
+    }
+  }
   const list = [...state.forest.sessions.values()].map((s) => ({
     sessionId: s.sessionId,
     projectSlug: s.projectSlug,
@@ -147,6 +155,15 @@ fastify.get("/api/sessions", async () => {
     promptCount: s.promptCount,
     startedAt: s.startedAt,
     lastActivityAt: s.lastActivityAt,
+    aiTitle: s.aiTitle,
+    firstPrompt: firstPromptBySession.get(s.sessionId)?.preview ?? null,
+    tokens: {
+      input: s.totalUsage.inputTokens,
+      output: s.totalUsage.outputTokens,
+      cacheRead: s.totalUsage.cacheReadTokens,
+      cacheCreation: s.totalUsage.cacheCreationTokens,
+    },
+    toolsUsed: s.toolsUsed,
   }));
   list.sort((a, b) => {
     const ta = a.lastActivityAt ?? "";
@@ -183,7 +200,7 @@ fastify.get<{ Params: { sessionId: string } }>("/api/sessions/:sessionId/chips",
       id: node.id,
       parentId: node.parentId,
       role: node.classification.role,
-      subtype: node.classification.role === "user" ? node.classification.subtype : null,
+      subtype: node.classification.subtype,
       timestamp: node.timestamp,
       preview: node.preview,
       contentLength: node.contentLength,

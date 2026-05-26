@@ -9,6 +9,7 @@ const ContentRender = lazy(() => import("./ContentRender.js"));
 export function MessagePane() {
   const sessionId = useStore((s) => s.selectedSessionId);
   const nodeId = useStore((s) => s.selectedNodeId);
+  const jumpNext = useStore((s) => s.jumpToNextUnread);
   const [data, setData] = useState<NodeResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -42,10 +43,21 @@ export function MessagePane() {
 
   if (!nodeId) {
     return (
-      <div className="flex-1 flex items-center justify-center text-zinc-400 text-sm">
-        Click a chip on the left to read the message.
-        <br />
-        Hint: <kbd className="px-1 mx-1 bg-zinc-800 rounded text-zinc-300">n</kbd> jumps to next unread reply.
+      <div className="flex-1 flex items-center justify-center text-zinc-400 text-sm bg-zinc-950">
+        <div className="text-center space-y-3">
+          <div>No message selected.</div>
+          <button
+            type="button"
+            onClick={jumpNext}
+            className="px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs"
+          >
+            Open next unread reply
+          </button>
+          <div className="text-xs text-zinc-500">
+            <kbd className="px-1 mx-1 bg-zinc-800 rounded text-zinc-300">n</kbd>
+            jumps to unread from the keyboard.
+          </div>
+        </div>
       </div>
     );
   }

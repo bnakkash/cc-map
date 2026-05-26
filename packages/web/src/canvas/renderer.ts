@@ -464,6 +464,7 @@ function renderOverview(
     }
     ctx.globalAlpha = 1;
   }
+  drawTimelineRails(ctx, layout, state, view);
   // Fork edges (rare, important): show even at overview LOD so branches are obvious.
   drawForkEdges(ctx, layout, state, view, /*alpha=*/ 0.9);
   drawSequenceLinks(ctx, layout, state, view);
@@ -492,6 +493,8 @@ function renderSession(
     ctx.fill();
     ctx.globalAlpha = 1;
   }
+  drawTimelineRails(ctx, layout, state, view);
+  drawCompactMarkers(ctx, layout, state, view, /*cardMode=*/ false);
   // Edges in muted colors
   drawEdges(ctx, layout, state, view, /*alpha=*/ 0.35);
   drawForkEdges(ctx, layout, state, view, /*alpha=*/ 0.85);
@@ -512,6 +515,89 @@ function renderSession(
   drawSelectionAndHover(ctx, layout, state);
   drawSelectionSpotlight(ctx, layout, state);
   drawLiveTip(ctx, layout, state);
+}
+
+function drawTimelineRails(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  state: RenderState,
+  view: { x0: number; y0: number; x1: number; y1: number },
+): void {
+  if (!layout.timelineAnchors) return;
+  const scale = state.transform.scale;
+  ctx.save();
+  ctx.lineWidth = Math.max(1, 1 / scale);
+  for (const band of layout.sessionBands) {
+    if (!intersects(band, view)) continue;
+    const anchor = layout.timelineAnchors.get(band.sessionId);
+    if (!anchor) continue;
+    const railX = state.nodeStyle === "cards" ? anchor.x - 14 : anchor.x;
+    const inViewX0 = state.nodeStyle === "cards" ? railX - 8 / scale : railX - 2 / scale;
+    const inViewX1 = state.nodeStyle === "cards" ? anchor.xRight : railX + 2 / scale;
+    if (inViewX1 < view.x0 || inViewX0 > view.x1) continue;
+    const isActive = band.sessionId === state.activeSessionId;
+    const isHover = band.sessionId === state.hoveredSessionId;
+    ctx.strokeStyle = projectColor(band.projectSlug);
+    ctx.globalAlpha = isActive ? 0.5 : isHover ? 0.38 : 0.2;
+    ctx.beginPath();
+    ctx.moveTo(railX, band.minY);
+    ctx.lineTo(railX, band.maxY);
+    ctx.stroke();
+    ctx.globalAlpha = isActive ? 0.35 : 0.16;
+    ctx.beginPath();
+    ctx.arc(railX, band.minY, 4 / scale, 0, Math.PI * 2);
+    ctx.fillStyle = projectColor(band.projectSlug);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+function drawCompactMarkers(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  state: RenderState,
+  view: { x0: number; y0: number; x1: number; y1: number },
+  cardMode: boolean,
+): void {
+  const compactNodes = [...layout.nodes.values()].filter((n) => n.isCompactBoundary);
+  if (compactNodes.length === 0) return;
+  const scale = state.transform.scale;
+  const labelFont = cardMode ? Math.min(10, 11 / scale) : Math.max(8, 10 / scale);
+  ctx.save();
+  ctx.font = `bold ${labelFont}px ui-sans-serif, system-ui, sans-serif`;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "left";
+  ctx.setLineDash([8 / scale, 5 / scale]);
+  for (const n of compactNodes) {
+    const band = layout.sessionBands.find((b) => b.sessionId === n.sessionId);
+    if (!band) continue;
+    const y = n.y - (cardMode ? 8 / scale : 0);
+    if (y < view.y0 || y > view.y1) continue;
+    if (band.maxX < view.x0 || band.minX > view.x1) continue;
+    const x0 = Math.max(band.minX, view.x0);
+    const x1 = Math.min(band.maxX, view.x1);
+    ctx.strokeStyle = "rgba(244, 114, 182, 0.9)";
+    ctx.lineWidth = Math.max(1.25, 2 / scale);
+    ctx.beginPath();
+    ctx.moveTo(x0, y);
+    ctx.lineTo(x1, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const label = "COMPACTED";
+    const padX = 5 / scale;
+    const pillH = Math.max(14 / scale, labelFont + 4 / scale);
+    const labelX = Math.min(Math.max(n.x + 6 / scale, x0), Math.max(x0, x1 - 70 / scale));
+    const labelW = ctx.measureText(label).width + padX * 2;
+    ctx.fillStyle = "rgba(244, 114, 182, 0.92)";
+    roundRect(ctx, labelX, y - pillH / 2, labelW, pillH, pillH / 2);
+    ctx.fill();
+    ctx.fillStyle = "#190816";
+    ctx.fillText(label, labelX + padX, y);
+    ctx.setLineDash([8 / scale, 5 / scale]);
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
 }
 
 function renderDetail(
@@ -547,6 +633,8 @@ function renderDetail(
     }
     ctx.globalAlpha = 1;
   }
+  drawTimelineRails(ctx, layout, state, view);
+  drawCompactMarkers(ctx, layout, state, view, /*cardMode=*/ false);
   drawEdges(ctx, layout, state, view, /*alpha=*/ 1);
   drawForkEdges(ctx, layout, state, view, /*alpha=*/ 1);
   drawSequenceLinks(ctx, layout, state, view);
@@ -559,13 +647,8 @@ function renderDetail(
     if (n.x + r < view.x0 || n.x - r > view.x1) continue;
     if (n.y + r < view.y0 || n.y - r > view.y1) continue;
     const isHi = state.highlightedNodeIds?.has(n.id);
-    let color = colorForNode(n, state.colorMode, colorCtx);
-    ctx.globalAlpha = nodeAlpha(n.role, n.subtype);
-    ctx.fillStyle = isHi ? "#fafafa" : color;
-    ctx.beginPath();
-    ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalAlpha = 1;
+    const color = colorForNode(n, state.colorMode, colorCtx);
+    drawDotNode(ctx, n, r, scale, isHi ? "#fafafa" : color);
     if (n.isFork) {
       ctx.strokeStyle = NODE_RING_FORK;
       ctx.lineWidth = Math.max(1.5, 2 / scale);
@@ -616,9 +699,10 @@ function drawInlineNodeLabels(
   const baseR = Math.max(LAYOUT.nodeRadius, 2.5 / scale);
   const padX = 6 / scale;
   const padY = 2 / scale;
-  const MAX_LABELS = 400;
+  const MAX_LABELS = scale >= 2.5 ? 260 : 140;
   // Below this much horizontal room (in screen pixels), don't even try.
   const MIN_LABEL_PX = 60;
+  const MAX_LABEL_PX = scale >= 2.5 ? 260 : 180;
 
   // Pre-bucket by Y so we can find each node's horizontal next-neighbor cheaply.
   const yBucket = (y: number) => Math.round(y / 4) * 4;
@@ -626,6 +710,7 @@ function drawInlineNodeLabels(
   for (const n of layout.nodes.values()) {
     if (n.x < view.x0 || n.x > view.x1 || n.y < view.y0 || n.y > view.y1) continue;
     if (!n.preview) continue;
+    if (!shouldInlineLabel(n, state)) continue;
     const k = yBucket(n.y);
     let arr = byY.get(k);
     if (!arr) {
@@ -651,10 +736,11 @@ function drawInlineNodeLabels(
         : Infinity;
       if (availLayout * scale < MIN_LABEL_PX) continue; // too cramped → skip
 
-      const text = n.preview;
-      const metrics = ctx.measureText(text);
-      // Cap at available room — but no truncation since we skip when too tight
-      const visibleWidth = Math.min(metrics.width, availLayout);
+      const text = n.isSessionStart ? `new session: ${n.preview}` : n.preview;
+      const maxLayoutWidth = Math.min(availLayout, MAX_LABEL_PX / scale);
+      if (maxLayoutWidth * scale < MIN_LABEL_PX) continue;
+      const labelText = ellipsizeToWidth(ctx, text, maxLayoutWidth);
+      const visibleWidth = ctx.measureText(labelText).width;
       const labelX = n.x + r + padX;
       const labelY = n.y;
 
@@ -665,20 +751,18 @@ function drawInlineNodeLabels(
         n.role === "user" && n.subtype === "prompt" ? "#a7f3d0" :
         n.role === "assistant" ? "#fde68a" :
         "#a1a1aa";
-      // Clip text to visibleWidth if needed (no ellipsis — clean cut)
-      if (metrics.width > availLayout) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(labelX - padX, labelY - fontPx, visibleWidth + padX * 2, fontPx * 2);
-        ctx.clip();
-        ctx.fillText(text, labelX, labelY);
-        ctx.restore();
-      } else {
-        ctx.fillText(text, labelX, labelY);
-      }
+      ctx.fillText(labelText, labelX, labelY);
       count += 1;
     }
   }
+}
+
+function shouldInlineLabel(n: LayoutNode, state: RenderState): boolean {
+  if (n.id === state.selectedId || n.id === state.hoveredId) return true;
+  if (state.highlightedNodeIds?.has(n.id)) return true;
+  if (n.role === "user" && n.subtype === "prompt") return true;
+  if (n.role === "assistant" && n.subtype === "text") return true;
+  return false;
 }
 
 /**
@@ -710,6 +794,104 @@ function nodeAlpha(role: "user" | "assistant", subtype: string | null): number {
   return 1.0;
 }
 
+function isLowSignalNode(n: LayoutNode): boolean {
+  if (n.role !== "user") return n.subtype === "tool-only" || n.subtype === "thinking";
+  return n.subtype === "tool-result" || n.subtype === "slash-command" || n.subtype === "slash-output" || n.subtype === "system-reminder";
+}
+
+function isSessionStartPromptNode(n: LayoutNode): boolean {
+  return n.isSessionStart && n.role === "user" && n.subtype === "prompt";
+}
+
+function formatTimeShort(timestamp: string): string {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return "";
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function formatCompactNumber(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(value);
+}
+
+function drawDotNode(
+  ctx: CanvasRenderingContext2D,
+  n: LayoutNode,
+  r: number,
+  scale: number,
+  color: string,
+): void {
+  const alpha = nodeAlpha(n.role, n.subtype);
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+
+  if (n.role === "user" && n.subtype !== "prompt") {
+    const size = r * 1.65;
+    if (n.subtype === "tool-result") {
+      roundRect(ctx, n.x - size / 2, n.y - size / 2, size, size, Math.max(1 / scale, size * 0.22));
+      ctx.fill();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(n.x, n.y - size / 2);
+      ctx.lineTo(n.x + size / 2, n.y);
+      ctx.lineTo(n.x, n.y + size / 2);
+      ctx.lineTo(n.x - size / 2, n.y);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    return;
+  }
+
+  ctx.beginPath();
+  ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  if (n.role === "user" && n.subtype === "prompt") {
+    ctx.strokeStyle = n.isSessionStart ? "rgba(34, 211, 238, 0.95)" : "rgba(167, 243, 208, 0.9)";
+    ctx.lineWidth = Math.max(1, 1.25 / scale);
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r + Math.max(1.5, 2 / scale), 0, Math.PI * 2);
+    ctx.stroke();
+    if (n.isSessionStart) {
+      const outer = r + Math.max(5, 6 / scale);
+      ctx.strokeStyle = "rgba(34, 211, 238, 0.85)";
+      ctx.lineWidth = Math.max(1.25, 1.75 / scale);
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, outer, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = "#22d3ee";
+      ctx.beginPath();
+      ctx.moveTo(n.x - outer * 0.55, n.y - outer * 0.95);
+      ctx.lineTo(n.x - outer * 0.55, n.y - outer * 0.18);
+      ctx.lineTo(n.x + outer * 0.12, n.y - outer * 0.56);
+      ctx.closePath();
+      ctx.fill();
+    }
+    if (n.isCompactBoundary) {
+      const marker = r + Math.max(7, 8 / scale);
+      ctx.strokeStyle = "rgba(244, 114, 182, 0.95)";
+      ctx.lineWidth = Math.max(1.5, 2 / scale);
+      ctx.beginPath();
+      ctx.moveTo(n.x - marker, n.y - marker * 0.65);
+      ctx.lineTo(n.x + marker, n.y - marker * 0.65);
+      ctx.moveTo(n.x - marker, n.y + marker * 0.65);
+      ctx.lineTo(n.x + marker, n.y + marker * 0.65);
+      ctx.stroke();
+    }
+  } else if (n.role === "assistant" && n.subtype === "thinking") {
+    ctx.strokeStyle = "rgba(250, 250, 250, 0.55)";
+    ctx.lineWidth = Math.max(1, 1 / scale);
+    ctx.setLineDash([2 / scale, 2 / scale]);
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r + Math.max(1, 1.5 / scale), 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
 /**
  * Card-mode rendering: each node is a text box showing its preview content.
  * Cards anchored at the layout x/y (top-left), wider than tall typically.
@@ -733,8 +915,8 @@ function renderCards(
   // Faint session backgrounds first
   for (const band of layout.sessionBands) {
     if (!intersects(band, view)) continue;
-    const w = band.maxX - band.minX + cardW;
-    const h = band.maxY - band.minY + defaultCardH;
+    const w = band.maxX - band.minX;
+    const h = band.maxY - band.minY;
     const isHover = band.sessionId === state.hoveredSessionId;
     const isActive = band.sessionId === state.activeSessionId;
     ctx.globalAlpha = isActive ? 0.18 : isHover ? 0.14 : 0.05;
@@ -749,6 +931,8 @@ function renderCards(
     }
     ctx.globalAlpha = 1;
   }
+  drawTimelineRails(ctx, layout, state, view);
+  drawCompactMarkers(ctx, layout, state, view, /*cardMode=*/ true);
 
   // Edges (parent bottom-center → child top-center) — use each card's own height
   ctx.lineWidth = Math.max(1, 1 / scale);
@@ -776,14 +960,15 @@ function renderCards(
   }
 
   // Cards
-  const fontPx = 11;
-  const headerPx = 9;
+  const fontPx = Math.min(11, 13 / scale);
+  const headerPx = Math.min(9, 10.5 / scale);
+  const cardLineHeight = Math.min(LAYOUT.cardLineHeight, 16 / scale);
   ctx.textBaseline = "top";
   for (const n of layout.nodes.values()) {
     const h = cardHOf(n);
     if (n.x + cardW < view.x0 || n.x > view.x1) continue;
     if (n.y + h < view.y0 || n.y > view.y1) continue;
-    drawCard(ctx, n, state, cardW, h, fontPx, headerPx, colorCtx);
+    drawCard(ctx, n, state, cardW, h, fontPx, headerPx, cardLineHeight, colorCtx);
   }
 
   if (state.subagentsCollapsed) drawSubagentBadges(ctx, layout, state, view, /*cardMode=*/ true);
@@ -803,6 +988,7 @@ function drawCard(
   cardH: number,
   fontPx: number,
   headerPx: number,
+  lineHeight: number,
   colorCtx: ColorContext,
 ): void {
   const x = n.x;
@@ -810,63 +996,87 @@ function drawCard(
   const isSelected = n.id === state.selectedId;
   const isHovered = n.id === state.hoveredId;
   const isHi = state.highlightedNodeIds?.has(n.id);
-  const color = colorForNode(n, state.colorMode, colorCtx);
+  const isSessionStart = isSessionStartPromptNode(n);
+  const color = n.isCompactBoundary ? "#f472b6" : isSessionStart ? "#22d3ee" : colorForNode(n, state.colorMode, colorCtx);
+  const isQuiet = isLowSignalNode(n);
 
   // Card background
-  ctx.fillStyle = isSelected ? "rgba(39, 39, 42, 0.98)" : "rgba(24, 24, 27, 0.92)";
+  ctx.fillStyle = isSelected
+    ? "rgba(39, 39, 42, 0.98)"
+    : isQuiet
+      ? "rgba(18, 18, 22, 0.82)"
+      : "rgba(24, 24, 27, 0.94)";
   roundRect(ctx, x, y, cardW, cardH, 6);
   ctx.fill();
 
+  ctx.fillStyle = color;
+  ctx.globalAlpha = isQuiet ? 0.55 : 0.9;
+  const accentW = Math.max(0.8, 3 / state.transform.scale);
+  roundRect(ctx, x, y, accentW, cardH, accentW);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
   // Border
-  ctx.strokeStyle = isSelected ? NODE_RING_SELECTED : isHovered ? "#ffffff" : isHi ? "#ffffff" : color;
-  ctx.lineWidth = isSelected || isHovered || isHi ? 2 : 1;
+  ctx.strokeStyle = isSelected ? NODE_RING_SELECTED : isHovered ? "#ffffff" : isHi ? "#ffffff" : isQuiet ? "rgba(113, 113, 122, 0.7)" : color;
+  ctx.lineWidth = Math.max(0.6, (isSelected || isHovered || isHi ? 2 : 1) / state.transform.scale);
   ctx.stroke();
   // Fork ring
   if (n.isFork) {
     ctx.strokeStyle = NODE_RING_FORK;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = Math.max(0.5, 1.5 / state.transform.scale);
     ctx.beginPath();
     ctx.roundRect?.(x - 2, y - 2, cardW + 4, cardH + 4, 8);
     ctx.stroke();
   }
 
-  // Header: role/subtype + (right-aligned) hint
+  // Header: role/subtype + time/tokens.
   ctx.fillStyle = color;
   ctx.font = `bold ${headerPx}px ui-sans-serif, system-ui, sans-serif`;
   const header =
+    n.isCompactBoundary ? "compacted here" :
+    isSessionStart ? "new session" :
     n.role === "user" && n.subtype === "prompt" ? "prompt" :
     n.role === "assistant" && n.subtype === "text" ? "assistant" :
     n.role === "assistant" && n.subtype === "tool-only" ? "tool call" :
     n.role === "assistant" && n.subtype === "thinking" ? "thinking" :
     n.role === "user" ? (n.subtype ?? "user") :
     "assistant";
-  ctx.fillText(header.toUpperCase(), x + LAYOUT.cardPadding, y + LAYOUT.cardPadding);
+  const metaParts = [formatTimeShort(n.timestamp)];
+  if (n.outputTokens > 0) metaParts.push(`${formatCompactNumber(n.outputTokens)} tok`);
+  const meta = metaParts.filter(Boolean).join(" · ");
+  ctx.textAlign = "right";
+  ctx.fillStyle = isQuiet ? "#71717a" : "#a1a1aa";
+  ctx.fillText(meta, x + cardW - LAYOUT.cardPadding, y + LAYOUT.cardPadding);
+  ctx.textAlign = "left";
+  ctx.fillStyle = color;
+  const headerMaxW = Math.max(40, cardW - LAYOUT.cardPadding * 2 - ctx.measureText(meta).width - 10);
+  ctx.fillText(ellipsizeToWidth(ctx, header.toUpperCase(), headerMaxW), x + LAYOUT.cardPadding, y + LAYOUT.cardPadding);
 
   // Subagent badge top-right
   if (n.isSidechain) {
     const label = "SUBAGENT";
     ctx.fillStyle = "#c084fc";
     ctx.textAlign = "right";
-    ctx.fillText(label, x + cardW - LAYOUT.cardPadding, y + LAYOUT.cardPadding);
+    ctx.fillText(label, x + cardW - LAYOUT.cardPadding, y + LAYOUT.cardPadding + headerPx + 2);
     ctx.textAlign = "left";
   }
 
   // Body text — wrap into the available body area inside this card. Lines available
   // is derived from the card's actual height (which the layout sized for this
   // node's preview length), so the text fits without external truncation.
-  ctx.fillStyle = "#e4e4e7";
+  ctx.fillStyle = isQuiet ? "#a1a1aa" : "#e4e4e7";
   ctx.font = `${fontPx}px ui-sans-serif, system-ui, sans-serif`;
   const text = n.preview || "(empty)";
   const bodyTop = y + LAYOUT.cardPadding + LAYOUT.cardHeaderHeight;
   const bodyHeight = cardH - LAYOUT.cardHeaderHeight - LAYOUT.cardPadding * 2;
-  const maxLines = Math.max(1, Math.floor(bodyHeight / LAYOUT.cardLineHeight));
+  const maxLines = Math.max(1, Math.floor(bodyHeight / lineHeight));
   drawWrappedText(
     ctx,
     text,
     x + LAYOUT.cardPadding,
     bodyTop,
     cardW - LAYOUT.cardPadding * 2,
-    LAYOUT.cardLineHeight,
+    lineHeight,
     maxLines,
   );
 }
@@ -888,16 +1098,19 @@ function drawWrappedText(
     const word = words[i]!;
     const test = line.length === 0 ? word : line + " " + word;
     if (ctx.measureText(test).width > maxWidth) {
+      if (line.length === 0) {
+        ctx.fillText(ellipsizeToWidth(ctx, word, maxWidth), x, y + lineIdx * lineHeight);
+        lineIdx += 1;
+        if (lineIdx >= maxLines) return;
+        continue;
+      }
       // commit current line
       if (lineIdx === maxLines - 1) {
         // Last line; truncate with ellipsis if there's more
         let truncated = line;
         const remaining = words.slice(i).join(" ");
         if (remaining.length > 0) {
-          while (ctx.measureText(truncated + " …").width > maxWidth && truncated.length > 1) {
-            truncated = truncated.slice(0, -1);
-          }
-          truncated = truncated + " …";
+          truncated = ellipsizeToWidth(ctx, truncated + " " + remaining, maxWidth);
         }
         ctx.fillText(truncated, x, y + lineIdx * lineHeight);
         return;
@@ -914,6 +1127,19 @@ function drawWrappedText(
   }
 }
 
+function ellipsizeToWidth(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let lo = 0;
+  let hi = text.length;
+  const suffix = "...";
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (ctx.measureText(text.slice(0, mid) + suffix).width <= maxWidth) lo = mid;
+    else hi = mid - 1;
+  }
+  return text.slice(0, Math.max(0, lo)).trimEnd() + suffix;
+}
+
 // ───── Drawing helpers ─────
 
 function drawLiveTip(
@@ -926,6 +1152,24 @@ function drawLiveTip(
   if (!n) return;
   const scale = state.transform.scale;
   const baseR = Math.max(LAYOUT.nodeRadius, 2.5 / scale);
+  if (state.nodeStyle === "cards") {
+    const cardH = n.cardHeight ?? LAYOUT.cardHeaderHeight + LAYOUT.cardLineHeight + LAYOUT.cardPadding * 2;
+    const phase = (state.nowMs % 1400) / 1400;
+    for (const offset of [0, 0.5]) {
+      const p = (phase + offset) % 1;
+      const pad = p * Math.max(8, 14 / scale);
+      const alpha = 1 - p;
+      ctx.strokeStyle = `rgba(52, 211, 153, ${alpha * 0.75})`;
+      ctx.lineWidth = Math.max(1.5, 2 / scale);
+      roundRect(ctx, n.x - pad, n.y - pad, LAYOUT.cardWidth + pad * 2, cardH + pad * 2, 8 + pad);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "#34d399";
+    ctx.beginPath();
+    ctx.arc(n.x + LAYOUT.cardPadding, n.y + LAYOUT.cardPadding, Math.max(3, 4 / scale), 0, Math.PI * 2);
+    ctx.fill();
+    return;
+  }
   // Pulse: phase oscillates 0..1 with period ~700ms
   const phase = (state.nowMs % 1400) / 1400;
   // Two concentric pulses for a sonar feel

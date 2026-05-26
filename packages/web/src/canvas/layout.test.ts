@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildLayout } from "./layout.js";
-import { DEFAULT_VISIBILITY, type ForestNode, type ForestPayload } from "./types.js";
+import { DEFAULT_VISIBILITY, LAYOUT, type ForestNode, type ForestPayload } from "./types.js";
 
 /** Build a ForestNode with sensible defaults — tests only override what they care about. */
 function mkNode(p: Partial<ForestNode> & Pick<ForestNode, "id" | "sessionId" | "timestamp">): ForestNode {
@@ -74,6 +74,18 @@ describe("buildLayout", () => {
       expect(l.edges.some((e) => e.fromId === "a" && e.toId === "b")).toBe(true);
     });
 
+    it("marks only the first real prompt in a session as the session start", () => {
+      const nodes = [
+        mkNode({ id: "p1", sessionId: "s1", timestamp: "2026-05-24T10:00:00Z" }),
+        mkNode({ id: "a1", sessionId: "s1", timestamp: "2026-05-24T10:00:05Z", parentId: "p1", role: "assistant", subtype: "text" }),
+        mkNode({ id: "p2", sessionId: "s1", timestamp: "2026-05-24T10:01:00Z", parentId: "a1" }),
+      ];
+      const l = buildLayout(mkPayload(nodes), "per-project", null);
+      expect(l.nodes.get("p1")!.isSessionStart).toBe(true);
+      expect(l.nodes.get("p2")!.isSessionStart).toBe(false);
+      expect(l.nodes.get("a1")!.isSessionStart).toBe(false);
+    });
+
     it("stacks fork siblings vertically with horizontal step", () => {
       const nodes = [
         mkNode({ id: "root", sessionId: "s1", timestamp: "2026-05-24T10:00:00Z" }),
@@ -105,6 +117,45 @@ describe("buildLayout", () => {
       expect(band.tokenSpark).toBeInstanceOf(Array);
       expect(l.bounds.maxX).toBeGreaterThan(l.bounds.minX);
       expect(l.bounds.maxY).toBeGreaterThan(l.bounds.minY);
+    });
+
+    it("wraps independent sessions into rows", () => {
+      const nodes = Array.from({ length: 6 }, (_, i) =>
+        mkNode({
+          id: `s${i + 1}a`,
+          sessionId: `s${i + 1}`,
+          timestamp: `2026-05-24T10:0${i}:00Z`,
+        }),
+      );
+      const l = buildLayout(mkPayload(nodes), "per-project", null);
+      const positions = nodes.map((n) => l.nodes.get(n.id)!);
+      expect(new Set(positions.map((n) => n.x)).size).toBeGreaterThan(1);
+      expect(new Set(positions.map((n) => n.y)).size).toBeGreaterThan(1);
+    });
+
+    it("applies custom session origins for spaces", () => {
+      const nodes = [
+        mkNode({ id: "s1a", sessionId: "s1", timestamp: "2026-05-24T10:00:00Z" }),
+        mkNode({ id: "s2a", sessionId: "s2", timestamp: "2026-05-24T10:01:00Z" }),
+      ];
+      const l = buildLayout(
+        mkPayload(nodes),
+        "per-project",
+        null,
+        DEFAULT_VISIBILITY,
+        "grid",
+        null,
+        "dots",
+        { s2: { x: 420, y: 160 } },
+      );
+      const s2Band = l.sessionBands.find((b) => b.sessionId === "s2")!;
+      const s2Node = l.nodes.get("s2a")!;
+      expect(s2Band.minX).toBe(420);
+      expect(s2Band.minY).toBe(160);
+      expect(s2Node.x).toBeGreaterThan(s2Band.minX);
+      expect(s2Node.y).toBeGreaterThan(s2Band.minY);
+      expect(l.bounds.maxX).toBeGreaterThan(s2Band.minX);
+      expect(l.bounds.maxY).toBeGreaterThan(s2Band.minY);
     });
 
     it("counts subagent roots per spawning parent", () => {
@@ -179,6 +230,20 @@ describe("buildLayout", () => {
       expect(p2.y).toBeGreaterThan(p1.y);
       expect(p2.x).toBe(p1.x);
     });
+
+    it("aligns session heads horizontally across sessions", () => {
+      const nodes = [
+        mkNode({ id: "s1p1", sessionId: "s1", timestamp: "2026-05-24T10:00:00Z" }),
+        mkNode({ id: "s1a1", sessionId: "s1", timestamp: "2026-05-24T10:00:05Z", parentId: "s1p1", role: "assistant", subtype: "text" }),
+        mkNode({ id: "s2p1", sessionId: "s2", timestamp: "2026-05-24T10:01:00Z" }),
+        mkNode({ id: "s2a1", sessionId: "s2", timestamp: "2026-05-24T10:01:05Z", parentId: "s2p1", role: "assistant", subtype: "text" }),
+      ];
+      const l = buildLayout(mkPayload(nodes), "per-project", null, DEFAULT_VISIBILITY, "column");
+      const s1p1 = l.nodes.get("s1p1")!;
+      const s2p1 = l.nodes.get("s2p1")!;
+      expect(s2p1.x).toBeGreaterThan(s1p1.x);
+      expect(s2p1.y).toBe(s1p1.y);
+    });
   });
 
   describe("cards mode", () => {
@@ -208,6 +273,29 @@ describe("buildLayout", () => {
       const long = l.nodes.get("long")!;
       expect(short.cardHeight).toBeGreaterThan(0);
       expect(long.cardHeight).toBeGreaterThan(short.cardHeight!);
+      expect(l.bounds.maxX).toBeGreaterThanOrEqual(short.x + LAYOUT.cardWidth);
+      expect(l.sessionBands[0]!.maxX).toBeGreaterThanOrEqual(short.x + LAYOUT.cardWidth);
+    });
+  });
+
+  describe("compact markers", () => {
+    it("marks the next visible node after a hidden /compact command", () => {
+      const nodes = [
+        mkNode({ id: "p1", sessionId: "s1", timestamp: "2026-05-24T10:00:00Z" }),
+        mkNode({
+          id: "compact",
+          sessionId: "s1",
+          timestamp: "2026-05-24T10:01:00Z",
+          parentId: "p1",
+          subtype: "slash-command",
+          preview: "<command-name>/compact</command-name>",
+        }),
+        mkNode({ id: "p2", sessionId: "s1", timestamp: "2026-05-24T10:02:00Z", parentId: "compact" }),
+      ];
+      const l = buildLayout(mkPayload(nodes), "per-project", null);
+      expect(l.nodes.has("compact")).toBe(false);
+      expect(l.nodes.get("p2")!.isCompactBoundary).toBe(true);
+      expect(l.nodes.get("p1")!.isCompactBoundary).toBe(false);
     });
   });
 });

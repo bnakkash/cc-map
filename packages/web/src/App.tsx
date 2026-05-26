@@ -9,6 +9,7 @@ import { useSse } from "./sse.js";
 import { useStore } from "./store.js";
 
 type ViewName = "viewer" | "map" | "calendar";
+const VIEW_KEY = "cc-map-current-view";
 
 const VIEW_DESC: Record<ViewName, string> = {
   viewer: "read one session's prompts & replies",
@@ -22,7 +23,18 @@ export default function App() {
   const setActiveSession = useStore((s) => s.setActiveSession);
   const selectedSessionId = useStore((s) => s.selectedSessionId);
   const error = useStore((s) => s.error);
-  const [view, setView] = useState<ViewName>("viewer");
+  const [view, setViewState] = useState<ViewName>(() => {
+    try {
+      const raw = localStorage.getItem(VIEW_KEY);
+      if (raw === "viewer" || raw === "map" || raw === "calendar") return raw;
+    } catch {}
+    return "map";
+  });
+
+  const setView = useCallback((next: ViewName) => {
+    setViewState(next);
+    try { localStorage.setItem(VIEW_KEY, next); } catch {}
+  }, []);
 
   useEffect(() => {
     void loadSessions();

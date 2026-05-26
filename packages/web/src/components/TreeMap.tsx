@@ -4,7 +4,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 // ~200KB of the initial bundle. Lazy-load so the first paint is the canvas,
 // not a Markdown lexer. Loads when the user first opens a node's detail.
 const ContentRender = lazy(() => import("./ContentRender.js"));
-import { api, type NodeResponse } from "../api.js";
+import { api, setForestCache, type NodeResponse } from "../api.js";
 import { useSse, type SseEvent } from "../sse.js";
 import { useStore } from "../store.js";
 import { buildLayout, timelineNowY } from "../canvas/layout.js";
@@ -32,9 +32,32 @@ import { NodeContextToolbar } from "./NodeContextToolbar.js";
 import { OnboardingTour } from "./OnboardingTour.js";
 import { LoadingSkeleton } from "./LoadingSkeleton.js";
 import { ProjectLegend } from "./ProjectLegend.js";
-import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type BackgroundStyle, type ColorMode, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type NodeStyle, type SessionFilter, type Space, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
+import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type BackgroundStyle, type ColorMode, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type NodeStyle, type SessionBand, type SessionFilter, type SessionPositionMap, type Space, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
 
 const PAN_THRESHOLD_PX = 5;
+
+type CanvasDrag = {
+  startX: number;
+  startY: number;
+  startTx: number;
+  startTy: number;
+  moved: boolean;
+} & (
+  | {
+      mode: "pan";
+      samples: { x: number; y: number; ts: number }[];
+    }
+  | {
+      mode: "move-session";
+      spaceId: string;
+      sessionId: string;
+      startSessionX: number;
+      startSessionY: number;
+      currentSessionX: number;
+      currentSessionY: number;
+      startScale: number;
+    }
+);
 
 export function TreeMap({ onClose }: { onClose: () => void }) {
   const [forest, setForest] = useState<ForestPayload | null>(null);
@@ -223,6 +246,23 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     setActiveSpaceId((cur) => (cur === id ? null : cur));
   }, []);
   const activeSpace = activeSpaceId ? spaces.find((s) => s.id === activeSpaceId) ?? null : null;
+  const [spaceMovePreview, setSpaceMovePreview] = useState<{
+    spaceId: string;
+    sessionId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const activeSpaceSessionPositions = useMemo<SessionPositionMap | null>(() => {
+    if (!activeSpace && !spaceMovePreview) return null;
+    const base: SessionPositionMap = { ...(activeSpace?.sessionPositions ?? {}) };
+    if (activeSpace && spaceMovePreview?.spaceId === activeSpace.id) {
+      base[spaceMovePreview.sessionId] = {
+        x: spaceMovePreview.x,
+        y: spaceMovePreview.y,
+      };
+    }
+    return Object.keys(base).length > 0 ? base : null;
+  }, [activeSpace, spaceMovePreview]);
 
   // Drag-to-Space state. Shift+drag a node on canvas → drags its session as a
   // chip. Hovering a Space chip in the sidebar highlights it; release drops
@@ -273,8 +313,23 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     if (!id) return;
     const sp = spaces.find((s) => s.id === id);
     if (!sp) return;
-    upsertSpace({ ...sp, sessionIds: sp.sessionIds.filter((x) => x !== sid) });
+    const { sessionPositions: existingPositions, ...spaceRest } = sp;
+    const nextPositions: SessionPositionMap = { ...(existingPositions ?? {}) };
+    delete nextPositions[sid];
+    const next: Space = { ...spaceRest, sessionIds: sp.sessionIds.filter((x) => x !== sid) };
+    if (Object.keys(nextPositions).length > 0) next.sessionPositions = nextPositions;
+    upsertSpace(next);
   }, [spaces, activeSpaceId, upsertSpace]);
+  const moveSessionInActiveSpace = useCallback((sid: string, x: number, y: number) => {
+    if (!activeSpace) return;
+    upsertSpace({
+      ...activeSpace,
+      sessionPositions: {
+        ...(activeSpace.sessionPositions ?? {}),
+        [sid]: { x, y },
+      },
+    });
+  }, [activeSpace, upsertSpace]);
   void persistSpaces; // exposed for future bulk ops
 
   // Submit the spawn modal — POST to server, then auto-add the new sessionId
@@ -384,6 +439,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     } catch {}
     return DEFAULT_FILTER;
   });
+  const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
   const updateFilter = useCallback((patch: Partial<SessionFilter>) => {
     setFilter((prev) => {
       const next = { ...prev, ...patch };
@@ -476,6 +532,21 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   }, [followLive]);
 
   const transformRef = useRef<Transform>({ tx: 0, ty: 0, scale: 1 });
+  const [zoomScale, setZoomScale] = useState(1);
+  useEffect(() => {
+    let raf = 0;
+    let last = -1;
+    const tick = () => {
+      const next = Number(transformRef.current.scale.toFixed(3));
+      if (next !== last) {
+        last = next;
+        setZoomScale(next);
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
   const dirtyRef = useRef(true);
   // Pan inertia — on mouse-drag or WASD release with velocity, the camera
   // keeps gliding for ~350ms with exponential decay. Cancelled on any new
@@ -515,10 +586,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   // during a disconnect window (e.g. when the server restarts).
   const fetchForest = useCallback(async () => {
     try {
-      const r = await fetch("/api/forest", {
-        headers: { Authorization: `Bearer ${localStorage.getItem("cc-map-token") ?? ""}` },
-      });
-      const data = (await r.json()) as ForestPayload;
+      const data = await api.forest({ force: true });
       setForest(data);
       setScopeProject((prev) => {
         if (prev) return prev;
@@ -605,7 +673,9 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             // Dedup by id (new nodes win, in case of revision)
             const existing = new Map(prev.nodes.map((n) => [n.id, n]));
             for (const n of toAdd) existing.set(n.id, n);
-            return { ...prev, nodes: [...existing.values()] };
+            const next = { ...prev, nodes: [...existing.values()] };
+            setForestCache(next);
+            return next;
           });
           // Build toasts for "interesting" new nodes in OTHER sessions.
           // Skip noise: tool-only assistant turns, tool-results, system messages.
@@ -650,7 +720,12 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         }, 250);
       }
     } else if (e.type === "active-session") {
-      setForest((prev) => prev ? { ...prev, activeSessionId: e.sessionId, activeSessionAt: e.at } : prev);
+      setForest((prev) => {
+        if (!prev) return prev;
+        const next = { ...prev, activeSessionId: e.sessionId, activeSessionAt: e.at };
+        setForestCache(next);
+        return next;
+      });
     }
   }, []);
   useSse(onSse, fetchForest);
@@ -746,10 +821,19 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   const layout: Layout | null = useMemo(() => {
     if (!forest) return null;
     const t0 = performance.now();
-    const l = buildLayout(forest, mode, mode === "per-project" ? scopeProject : null, visibility, direction, allowedSessions, nodeStyle);
+    const l = buildLayout(
+      forest,
+      mode,
+      mode === "per-project" ? scopeProject : null,
+      visibility,
+      direction,
+      allowedSessions,
+      nodeStyle,
+      activeSpaceSessionPositions,
+    );
     console.log(`layout: ${l.nodes.size} nodes, ${l.sessionBands.length} sessions in ${(performance.now() - t0).toFixed(0)}ms`);
     return l;
-  }, [forest, mode, scopeProject, visibility, direction, allowedSessions, nodeStyle]);
+  }, [forest, mode, scopeProject, visibility, direction, allowedSessions, nodeStyle, activeSpaceSessionPositions]);
 
   // Morph trigger: capture old positions from prevLayoutRef → animate them
   // toward the just-computed layout's positions. Fires on direction/nodeStyle
@@ -1151,14 +1235,27 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       ? layout.sessionBands.find((b) => b.sessionId === effectiveActiveSession)
       : null;
     const target = activeBand ?? mostRecentSessionBand(layout, forest);
+    const fitForCurrentNodeStyle = (bounds: { minX: number; minY: number; maxX: number; maxY: number }, padding = 32) => {
+      const next = fitToBounds(bounds, size.w, size.h, padding);
+      if (nodeStyle !== "cards") return next;
+      const maxCardScale = 1.35;
+      if (next.scale <= maxCardScale) return next;
+      const cx = (bounds.minX + bounds.maxX) / 2;
+      const cy = (bounds.minY + bounds.maxY) / 2;
+      return {
+        tx: size.w / 2 - cx * maxCardScale,
+        ty: size.h / 2 - cy * maxCardScale,
+        scale: maxCardScale,
+      };
+    };
     // First fit = direct (no animation). Subsequent direction-change fits = animated.
     if (directionChangedRef.current && fittedKey.current !== "") {
       directionChangedRef.current = false;
-      if (target) animateTo(fitToBounds(target, size.w, size.h, 80), 400);
-      else animateTo(fitTransform(layout, size.w, size.h), 400);
+      if (target) animateTo(fitForCurrentNodeStyle(target, 80), 400);
+      else animateTo(fitForCurrentNodeStyle(layout.bounds), 400);
     } else {
-      if (target) transformRef.current = fitToBounds(target, size.w, size.h, 80);
-      else transformRef.current = fitTransform(layout, size.w, size.h);
+      if (target) transformRef.current = fitForCurrentNodeStyle(target, 80);
+      else transformRef.current = fitForCurrentNodeStyle(layout.bounds);
       directionChangedRef.current = false;
     }
     fittedKey.current = key;
@@ -1340,15 +1437,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   }, [layout, size, selected, hovered, mode, matches, forest, liveTipId, effectiveActiveSession, nodeStyle, colorMode, visibility.subagent, multiSelected, backgroundStyle]);
 
   // ───── Mouse interactions ─────
-  const dragRef = useRef<{
-    startX: number; startY: number;
-    startTx: number; startTy: number;
-    moved: boolean;
-    // Sample buffer for velocity-on-release: keep the last few frames'
-    // (x, y, ts) so we can compute average velocity over ~80ms (smoother
-    // than just last-frame, which can be 0 if the cursor stopped briefly).
-    samples: { x: number; y: number; ts: number }[];
-  } | null>(null);
+  const dragRef = useRef<CanvasDrag | null>(null);
 
   const onMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
@@ -1359,9 +1448,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       const sy = e.clientY - rect.top;
       const hit = hitTest(layout, transformRef.current, sx, sy, nodeStyle);
       if (hit) {
-        const sid = hit.kind === "node"
-          ? layout.nodes.get(hit.id)?.sessionId
-          : hit.id;
+        const sid = sessionIdForCanvasHit(layout, hit);
         if (sid) {
           const band = layout.sessionBands.find((b) => b.sessionId === sid);
           const label = band?.firstPrompt?.slice(0, 60) || sid.slice(0, 8);
@@ -1408,9 +1495,44 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         return;
       }
     }
+    if (layout && activeSpace && !e.ctrlKey && !e.metaKey) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      const hit = hitTest(layout, transformRef.current, sx, sy, nodeStyle);
+      const sid = sessionIdForCanvasHit(layout, hit);
+      if (sid && activeSpace.sessionIds.includes(sid)) {
+        const band = layout.sessionBands.find((b) => b.sessionId === sid);
+        if (band) {
+          const saved = activeSpace.sessionPositions?.[sid];
+          const startSessionX = saved && Number.isFinite(saved.x) ? saved.x : band.minX;
+          const startSessionY = saved && Number.isFinite(saved.y) ? saved.y : band.minY;
+          transitionRef.current = null;
+          inertiaRef.current = null;
+          dragRef.current = {
+            mode: "move-session",
+            startX: e.clientX,
+            startY: e.clientY,
+            startTx: transformRef.current.tx,
+            startTy: transformRef.current.ty,
+            moved: false,
+            spaceId: activeSpace.id,
+            sessionId: sid,
+            startSessionX,
+            startSessionY,
+            currentSessionX: startSessionX,
+            currentSessionY: startSessionY,
+            startScale: transformRef.current.scale,
+          };
+          e.currentTarget.style.cursor = "grabbing";
+          return;
+        }
+      }
+    }
     transitionRef.current = null;
     inertiaRef.current = null; // mousedown cancels any in-flight inertia
     dragRef.current = {
+      mode: "pan",
       startX: e.clientX,
       startY: e.clientY,
       startTx: transformRef.current.tx,
@@ -1418,7 +1540,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       moved: false,
       samples: [{ x: e.clientX, y: e.clientY, ts: performance.now() }],
     };
-  }, [layout, liveTipId, size.w, size.h, visibility.subagent, nodeStyle, toggleVisibility]);
+  }, [layout, liveTipId, size.w, size.h, visibility.subagent, nodeStyle, toggleVisibility, activeSpace]);
 
   const onMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const drag = dragRef.current;
@@ -1429,18 +1551,34 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       const dy = e.clientY - drag.startY;
       if (!drag.moved && Math.hypot(dx, dy) > PAN_THRESHOLD_PX) drag.moved = true;
       if (drag.moved) {
-        transformRef.current = {
-          ...transformRef.current,
-          tx: drag.startTx + dx,
-          ty: drag.startTy + dy,
-        };
+        e.currentTarget.style.cursor = "grabbing";
+        if (drag.mode === "move-session") {
+          const nextX = drag.startSessionX + dx / drag.startScale;
+          const nextY = drag.startSessionY + dy / drag.startScale;
+          drag.currentSessionX = nextX;
+          drag.currentSessionY = nextY;
+          setSpaceMovePreview({
+            spaceId: drag.spaceId,
+            sessionId: drag.sessionId,
+            x: nextX,
+            y: nextY,
+          });
+        } else {
+          transformRef.current = {
+            ...transformRef.current,
+            tx: drag.startTx + dx,
+            ty: drag.startTy + dy,
+          };
+        }
         dirtyRef.current = true;
       }
-      // Sample for inertia velocity. Keep only the most recent ~80ms of samples
-      // so a brief pause before release doesn't poison the velocity calculation.
-      const now = performance.now();
-      drag.samples.push({ x: e.clientX, y: e.clientY, ts: now });
-      while (drag.samples.length > 2 && now - drag.samples[0]!.ts > 80) drag.samples.shift();
+      if (drag.mode === "pan") {
+        // Sample for inertia velocity. Keep only the most recent ~80ms of samples
+        // so a brief pause before release doesn't poison the velocity calculation.
+        const now = performance.now();
+        drag.samples.push({ x: e.clientX, y: e.clientY, ts: now });
+        while (drag.samples.length > 2 && now - drag.samples[0]!.ts > 80) drag.samples.shift();
+      }
     } else if (layout) {
       const mx = e.clientX - rect.left;
       const my = e.clientY - rect.top;
@@ -1469,6 +1607,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       if (hit) {
         if (e.shiftKey) cursor = "copy";
         else if (e.ctrlKey || e.metaKey) cursor = "cell";
+        else if (activeSpace) cursor = "move";
         else cursor = "pointer";
       }
       e.currentTarget.style.cursor = cursor;
@@ -1477,7 +1616,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         dirtyRef.current = true;
       }
     }
-  }, [layout, hovered, nodeStyle]);
+  }, [layout, hovered, nodeStyle, activeSpace]);
 
   const onMouseUp = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const drag = dragRef.current;
@@ -1496,10 +1635,19 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       dirtyRef.current = true;
       return;
     }
+    if (drag.mode === "move-session") {
+      setSpaceMovePreview(null);
+      if (drag.moved) {
+        moveSessionInActiveSpace(drag.sessionId, drag.currentSessionX, drag.currentSessionY);
+        dirtyRef.current = true;
+        return;
+      }
+    }
     if (drag.moved) {
       // Compute average velocity over the sampled window. Skip inertia for
       // tiny motions (mouse barely moved) and for paused releases (samples
       // span a long time but no recent motion).
+      if (drag.mode !== "pan") return;
       const samples = drag.samples;
       if (samples.length >= 2) {
         const first = samples[0]!;
@@ -1539,7 +1687,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       if (band) animateTo(fitToBounds(band, size.w, size.h, 80));
     }
     dirtyRef.current = true;
-  }, [layout, size, nodeStyle]);
+  }, [layout, size, nodeStyle, sparkHover, moveSessionInActiveSpace]);
 
   const onDoubleClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     // Google-Maps-style: double-click zooms in 2× at the cursor.
@@ -2073,11 +2221,20 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     if (hovered.kind === "node") {
       const n = forest.nodes.find((x) => x.id === hovered.id);
       if (!n) return null;
+      const isSessionStart = isSessionStartPrompt(n, forest);
+      const layoutNode = layout?.nodes.get(n.id);
+      const isCompactBoundary = layoutNode?.isCompactBoundary ?? false;
       const gapMs = layout?.nodeGapToPrev?.get(n.id);
       const metaParts: string[] = [
         new Date(n.timestamp).toLocaleString(),
         n.sessionId.slice(0, 8),
       ];
+      if (isSessionStart) {
+        metaParts.push("new session");
+      }
+      if (isCompactBoundary) {
+        metaParts.push("compacted here");
+      }
       if (n.role === "assistant" && n.outputTokens > 0) {
         metaParts.push(`${n.outputTokens.toLocaleString()} out`);
       }
@@ -2087,12 +2244,16 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       const branches = forkInfo.get(n.id) ?? null;
       return {
         kind: "node" as const,
-        title: n.role === "assistant"
+        title: isCompactBoundary
+          ? "compact boundary"
+          : isSessionStart
+          ? "new session prompt"
+          : n.role === "assistant"
           ? (n.subtype === "tool-only" ? "assistant · tool call" : n.subtype === "thinking" ? "assistant · thinking" : "assistant")
           : (n.subtype ?? "user"),
         body: n.preview || "(empty)",
         meta: metaParts.join(" · "),
-        color: n.isSidechain ? "#c084fc" : n.role === "assistant" ? "#fbbf24" : n.subtype === "prompt" ? "#34d399" : "#71717a",
+        color: isCompactBoundary ? "#f472b6" : isSessionStart ? "#22d3ee" : n.isSidechain ? "#c084fc" : n.role === "assistant" ? "#fbbf24" : n.subtype === "prompt" ? "#34d399" : "#71717a",
         isSidechain: n.isSidechain,
         branches,
       };
@@ -2342,7 +2503,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                 className={`px-2 py-1 rounded text-xs flex-1 ${direction === d ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
                 title={
                   d === "grid" ? "trees wrap into rows (square-ish)" :
-                  d === "column" ? "each session on its own row, prompts vertical, replies horizontal" :
+                  d === "column" ? "sessions line up horizontally; prompts vertical, replies horizontal" :
                   "one column per session; Y is real time — reveals burst sessions and idle gaps"
                 }
               >
@@ -2409,6 +2570,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         <SidebarGroup
           id="live"
           title="Live"
+          defaultOpen={false}
           summary={`follow ${followLive ? "on" : "off"} · ${inputMode}`}
         >
         <div className="space-y-1">
@@ -2465,6 +2627,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         <SidebarGroup
           id="filter"
           title="Filter"
+          defaultOpen={false}
           summary={(() => {
             const parts: string[] = [];
             if (filter.startDate || filter.endDate) parts.push(`date`);
@@ -2515,7 +2678,18 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             />
             <span>★ bookmarked only</span>
           </label>
-          {availableTools.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setAdvancedFiltersOpen((v) => !v)}
+            className="w-full text-left px-2 py-1 rounded bg-zinc-900 hover:bg-zinc-800 text-xs text-zinc-300 flex items-center justify-between"
+          >
+            <span>Advanced filters</span>
+            <span className="text-zinc-500 text-[10px]">
+              {filter.requiredTools.length > 0 ? `${filter.requiredTools.length} tools` : "visibility"}
+              {" "}{advancedFiltersOpen ? "up" : "down"}
+            </span>
+          </button>
+          {advancedFiltersOpen && availableTools.length > 0 && (
             <div>
               <div className="text-zinc-500 text-[10px] mt-1 mb-1">tools used (any)</div>
               <div className="flex flex-wrap gap-1 max-h-32 overflow-y-auto">
@@ -2544,7 +2718,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             </div>
           )}
         </div>
-        <div>
+        {advancedFiltersOpen && <div>
           <div className="text-zinc-500 text-xs mb-1">Show</div>
           <VisToggle label="Prompts"        color="#34d399" on={visibility.prompt}        onChange={() => toggleVisibility("prompt")} />
           <VisToggle label="Replies (text)" color="#fbbf24" on={visibility.assistantText} onChange={() => toggleVisibility("assistantText")} />
@@ -2554,7 +2728,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           <VisToggle label="Tool results"   color="#52525b" on={visibility.toolResult}    onChange={() => toggleVisibility("toolResult")} />
           <VisToggle label="Slash commands" color="#71717a" on={visibility.slashCommand}  onChange={() => toggleVisibility("slashCommand")} />
           <VisToggle label="System reminders" color="#3f3f46" on={visibility.systemReminder} onChange={() => toggleVisibility("systemReminder")} />
-        </div>
+        </div>}
         {(filter.startDate || filter.endDate || filter.requiredTools.length > 0 || filter.bookmarkedOnly ||
           JSON.stringify(visibility) !== JSON.stringify(DEFAULT_VISIBILITY)) && (
           <button
@@ -2748,6 +2922,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         <SidebarGroup
           id="activity"
           title="Activity"
+          defaultOpen={false}
           summary={`${forest.sessionCount} sessions`}
         >
           <div>
@@ -2827,6 +3002,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           onDoubleClick={onDoubleClick}
           onContextMenu={onContextMenu}
           onMouseLeave={() => {
+            if (dragRef.current?.mode === "move-session") setSpaceMovePreview(null);
             dragRef.current = null;
             setHovered(null);
             setCursor(null);
@@ -2946,6 +3122,15 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             animateTo({ scale: newScale, tx: cx - lx * newScale, ty: cy - ly * newScale }, 200);
           }}
         />
+
+        {layout && zoomScale < 0.12 && !searchOpen && (
+          <LowZoomOverview
+            layout={layout}
+            forest={forest}
+            onFitAll={() => animateTo(fitTransform(layout, size.w, size.h), 220)}
+            onFitSession={(band) => animateTo(fitToBounds(band, size.w, size.h, 80), 260)}
+          />
+        )}
 
         {/* Search overlay */}
         {searchOpen && (
@@ -3659,7 +3844,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             </KbdGroup>
             <KbdGroup title="Modes (sidebar)">
               <KbdRow keys={["grid"]} desc="square-ish tree-map; forks stack" />
-              <KbdRow keys={["column"]} desc="prompts down, replies right" />
+              <KbdRow keys={["column"]} desc="session heads aligned; prompts down, replies right" />
               <KbdRow keys={["timeline"]} desc="one column per session; Y = real time" />
               <KbdRow keys={["dots / cards"]} desc="dot or text-card rendering" />
               <KbdRow keys={["role / recency / cost"]} desc="color modes (heat-maps add legend)" />
@@ -3739,6 +3924,67 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function LowZoomOverview({
+  layout,
+  forest,
+  onFitAll,
+  onFitSession,
+}: {
+  layout: Layout;
+  forest: ForestPayload;
+  onFitAll: () => void;
+  onFitSession: (band: SessionBand) => void;
+}) {
+  const topSessions = useMemo(
+    () => [...layout.sessionBands].sort((a, b) => b.nodeCount - a.nodeCount).slice(0, 5),
+    [layout],
+  );
+  const projectCount = layout.projectBands.size;
+  return (
+    <div className="absolute left-3 bottom-10 z-20 w-72 bg-zinc-950/90 border border-zinc-800 rounded-lg shadow-xl backdrop-blur p-3 text-xs">
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <div>
+          <div className="text-zinc-200 font-semibold">Overview</div>
+          <div className="text-zinc-500">
+            {layout.sessionBands.length} sessions
+            {projectCount > 1 ? ` · ${projectCount} projects` : ""}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onFitAll}
+          className="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200"
+        >
+          fit all
+        </button>
+      </div>
+      <div className="space-y-1">
+        {topSessions.map((band) => {
+          const title = forest.sessionTitles[band.sessionId]?.aiTitle || band.firstPrompt || band.sessionId.slice(0, 8);
+          return (
+            <button
+              key={band.sessionId}
+              type="button"
+              onClick={() => onFitSession(band)}
+              className="w-full text-left px-2 py-1.5 rounded hover:bg-zinc-900 flex items-center gap-2"
+              title={title}
+            >
+              <span
+                className="inline-block h-2 w-2 rounded-sm shrink-0"
+                style={{ background: projectColor(band.projectSlug) }}
+              />
+              <span className="min-w-0 flex-1">
+                <span className="block text-zinc-200 truncate">{title}</span>
+                <span className="block text-zinc-500 font-mono">{band.nodeCount} nodes · {prettySlug(band.projectSlug)}</span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -4449,6 +4695,33 @@ function roleColor(role: "user" | "assistant", subtype: string | null): string {
   return "#a1a1aa";
 }
 
+function sessionIdForCanvasHit(
+  layout: Layout,
+  hit: { kind: "node" | "session"; id: string } | null,
+): string | null {
+  if (!hit) return null;
+  if (hit.kind === "session") return hit.id;
+  const node = layout.nodes.get(hit.id);
+  if (!node) return null;
+  const containingBand = layout.sessionBands.find((band) =>
+    node.x >= band.minX &&
+    node.x <= band.maxX &&
+    node.y >= band.minY &&
+    node.y <= band.maxY
+  );
+  return containingBand?.sessionId ?? node.sessionId;
+}
+
+function isSessionStartPrompt(node: ForestNode, forest: ForestPayload): boolean {
+  if (node.role !== "user" || node.subtype !== "prompt") return false;
+  return !forest.nodes.some((candidate) =>
+    candidate.sessionId === node.sessionId &&
+    candidate.role === "user" &&
+    candidate.subtype === "prompt" &&
+    candidate.timestamp < node.timestamp
+  );
+}
+
 // ───── Detail panel ─────
 
 function DetailPanel({
@@ -4468,6 +4741,8 @@ function DetailPanel({
 }) {
   const node = forest.nodes.find((n) => n.id === selectedId);
   const sessionMeta = layout?.sessionBands.find((b) => b.sessionId === node?.sessionId);
+  const selectedIsSessionStart = node ? isSessionStartPrompt(node, forest) : false;
+  const selectedIsCompactBoundary = layout?.nodes.get(selectedId)?.isCompactBoundary ?? false;
 
   const { prevId, nextId } = useMemo(() => {
     if (!node) return { prevId: null, nextId: null };
@@ -4512,15 +4787,29 @@ function DetailPanel({
           <div className="flex items-center gap-2">
             <span
               className={
-                node.role === "assistant"
+                selectedIsCompactBoundary
+                  ? "text-pink-300 font-semibold"
+                  : selectedIsSessionStart
+                  ? "text-cyan-300 font-semibold"
+                  : node.role === "assistant"
                   ? "text-amber-400 font-semibold"
                   : node.subtype === "prompt"
                     ? "text-emerald-400 font-semibold"
                     : "text-zinc-500"
               }
             >
-              {node.role}{node.subtype ? `:${node.subtype}` : ""}
+              {selectedIsCompactBoundary ? "compact boundary" : selectedIsSessionStart ? "new session prompt" : `${node.role}${node.subtype ? `:${node.subtype}` : ""}`}
             </span>
+            {selectedIsCompactBoundary && (
+              <span className="text-[10px] uppercase tracking-wide text-pink-300 bg-pink-500/10 border border-pink-500/30 rounded px-1">
+                compacted
+              </span>
+            )}
+            {selectedIsSessionStart && (
+              <span className="text-[10px] uppercase tracking-wide text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 rounded px-1">
+                start
+              </span>
+            )}
             <span className="text-zinc-500">{new Date(node.timestamp).toLocaleString()}</span>
           </div>
           <div className="text-zinc-500 truncate" title={node.projectSlug}>{prettySlug(node.projectSlug)}</div>

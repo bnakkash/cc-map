@@ -11,6 +11,7 @@ import {
   type NodeStyle,
   type SequenceLink,
   type SessionBand,
+  type SessionPositionMap,
   type ViewMode,
   type VisibilityFilter,
   isNodeVisible,
@@ -40,6 +41,7 @@ export function buildLayout(
   direction: LayoutDirection = "grid",
   allowedSessions: Set<string> | null = null,
   nodeStyle: NodeStyle = "dots",
+  sessionPositions: SessionPositionMap | null = null,
 ): Layout {
   // Default vertical step (dots, or column-mode prompt placement). Card-mode
   // uses per-node heights computed from preview text length instead — fixed
@@ -128,6 +130,12 @@ export function buildLayout(
     return cardHeightFor(id) + LAYOUT.cardSpacingV;
   };
 
+  const visualRight = (ln: LayoutNode): number =>
+    ln.x + (nodeStyle === "cards" ? LAYOUT.cardWidth : 0);
+  const visualBottom = (ln: LayoutNode): number =>
+    ln.y + (nodeStyle === "cards" ? (ln.cardHeight ?? cardHeightFor(ln.id)) : 0);
+  const boundsPad = nodeStyle === "cards" ? 10 : LAYOUT.nodeRadius * 2;
+
   // Forks set (for highlighting): parent uuids whose children belong to 2+ sessions
   const forkParents = new Set<string>();
   for (const f of payload.forks) {
@@ -143,6 +151,38 @@ export function buildLayout(
     if (!n.isSidechain || n.parentId == null) continue;
     subagentCountByParent.set(n.parentId, (subagentCountByParent.get(n.parentId) ?? 0) + 1);
   }
+
+  const sessionStartPromptId = new Map<string, { id: string; timestamp: string }>();
+  for (const n of scopeNodes) {
+    if (n.role !== "user" || n.subtype !== "prompt") continue;
+    const current = sessionStartPromptId.get(n.sessionId);
+    if (!current || n.timestamp < current.timestamp) {
+      sessionStartPromptId.set(n.sessionId, { id: n.id, timestamp: n.timestamp });
+    }
+  }
+  const isSessionStartPrompt = (n: ForestNode): boolean =>
+    n.role === "user" && n.subtype === "prompt" && sessionStartPromptId.get(n.sessionId)?.id === n.id;
+  const isCompactCommand = (n: ForestNode): boolean =>
+    n.role === "user" && n.subtype === "slash-command" && /\/compact\b/i.test(n.preview);
+  const compactBoundaryIds = new Set<string>();
+  const visibleBySession = new Map<string, ForestNode[]>();
+  for (const n of visibleNodes) {
+    const list = visibleBySession.get(n.sessionId);
+    if (list) list.push(n);
+    else visibleBySession.set(n.sessionId, [n]);
+  }
+  for (const list of visibleBySession.values()) {
+    list.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  }
+  for (const compactNode of scopeNodes.filter(isCompactCommand).sort((a, b) => a.timestamp.localeCompare(b.timestamp))) {
+    const candidates = visibleBySession.get(compactNode.sessionId);
+    if (!candidates || candidates.length === 0) continue;
+    const nextVisible = candidates.find((n) => n.timestamp >= compactNode.timestamp);
+    const previousVisible = [...candidates].reverse().find((n) => n.timestamp < compactNode.timestamp);
+    const boundary = nextVisible ?? previousVisible;
+    if (boundary) compactBoundaryIds.add(boundary.id);
+  }
+  const isCompactBoundary = (n: ForestNode): boolean => compactBoundaryIds.has(n.id);
 
   // Per-session start time (earliest VISIBLE node timestamp) for stable ordering.
   const sessionStartTime = new Map<string, string>();
@@ -242,6 +282,8 @@ export function buildLayout(
         role: n.role,
         subtype: n.subtype,
         isSidechain: n.isSidechain,
+        isSessionStart: isSessionStartPrompt(n),
+        isCompactBoundary: isCompactBoundary(n),
         isFork: forkParents.has(n.id),
         isShared: n.sessionsIn > 1,
         preview: n.preview,
@@ -327,7 +369,11 @@ export function buildLayout(
       return sa.localeCompare(sb);
     });
 
-    let cursorY = mode === "all-projects" ? LAYOUT.projectLabelHeight : 0;
+    const sessionGapX = nodeStyle === "cards" ? 110 : 88;
+    const rootGap = nodeStyle === "cards" ? LAYOUT.cardSpacingV : LAYOUT.columnSpineV;
+    let cursorX = 0;
+    let rowBaseY = mode === "all-projects" ? LAYOUT.projectLabelHeight : 0;
+    let projectRowMaxY = rowBaseY;
     let lastProject: string | null = null;
     for (const sid of sessionsInOrder) {
       const sessionRoots = roots
@@ -340,28 +386,37 @@ export function buildLayout(
       if (sessionRoots.length === 0) continue;
       const proj = nodeMap.get(sessionRoots[0]!)!.projectSlug;
       if (lastProject !== null && proj !== lastProject && mode === "all-projects") {
-        cursorY += LAYOUT.projectGap;
+        cursorX = 0;
+        rowBaseY = projectRowMaxY + LAYOUT.projectGap;
+        projectRowMaxY = rowBaseY;
       }
       lastProject = proj;
 
-      const startY = cursorY;
+      const sessionX = cursorX;
+      let rootY = rowBaseY;
       for (const rid of sessionRoots) {
-        const reached = placeColumnSubtree(rid, 0, cursorY);
-        cursorY = reached + LAYOUT.columnSpineV;
+        const reached = placeColumnSubtree(rid, sessionX, rootY);
+        rootY = reached + rootGap;
       }
-      cursorY += LAYOUT.columnSessionGap;
 
-      // Track project band y-extent
+      const sessionNodes = [...layoutNodes.values()].filter((n) => n.sessionId === sid);
+      if (sessionNodes.length === 0) continue;
+      const minX = sessionNodes.reduce((m, n) => Math.min(m, n.x), Infinity);
+      const maxX = sessionNodes.reduce((m, n) => Math.max(m, visualRight(n)), -Infinity);
+      const minY = sessionNodes.reduce((m, n) => Math.min(m, n.y), Infinity);
+      const maxY = sessionNodes.reduce((m, n) => Math.max(m, visualBottom(n)), -Infinity);
+
       const pb = projectBands.get(proj);
-      const maxX = [...layoutNodes.values()]
-        .filter((n) => n.sessionId === sid)
-        .reduce((m, n) => Math.max(m, n.x), 0);
       if (!pb) {
-        projectBands.set(proj, { minX: 0, maxX, minY: startY, maxY: cursorY });
+        projectBands.set(proj, { minX, maxX, minY, maxY });
       } else {
+        pb.minX = Math.min(pb.minX, minX);
         pb.maxX = Math.max(pb.maxX, maxX);
-        pb.maxY = cursorY;
+        pb.minY = Math.min(pb.minY, minY);
+        pb.maxY = Math.max(pb.maxY, maxY);
       }
+      cursorX = maxX + sessionGapX;
+      projectRowMaxY = Math.max(projectRowMaxY, maxY);
     }
 
     // Bounds
@@ -372,13 +427,13 @@ export function buildLayout(
       for (const n of layoutNodes.values()) {
         if (n.x < bounds.minX) bounds.minX = n.x;
         if (n.y < bounds.minY) bounds.minY = n.y;
-        if (n.x > bounds.maxX) bounds.maxX = n.x;
-        if (n.y > bounds.maxY) bounds.maxY = n.y;
+        if (visualRight(n) > bounds.maxX) bounds.maxX = visualRight(n);
+        if (visualBottom(n) > bounds.maxY) bounds.maxY = visualBottom(n);
       }
-      bounds.minX -= LAYOUT.nodeRadius * 2;
-      bounds.minY -= LAYOUT.nodeRadius * 2;
-      bounds.maxX += LAYOUT.nodeRadius * 2;
-      bounds.maxY += LAYOUT.nodeRadius * 2;
+      bounds.minX -= boundsPad;
+      bounds.minY -= boundsPad;
+      bounds.maxX += boundsPad;
+      bounds.maxY += boundsPad;
     }
 
     // Session bands (same algorithm as grid mode but using column-placed nodes)
@@ -386,11 +441,11 @@ export function buildLayout(
     for (const ln of layoutNodes.values()) {
       let acc = bandAcc.get(ln.sessionId);
       if (!acc) {
-        acc = { sessionId: ln.sessionId, projectSlug: ln.projectSlug, minX: ln.x, maxX: ln.x, minY: ln.y, maxY: ln.y, nodeCount: 0, firstPromptTs: "", firstPrompt: "" };
+        acc = { sessionId: ln.sessionId, projectSlug: ln.projectSlug, minX: ln.x, maxX: visualRight(ln), minY: ln.y, maxY: visualBottom(ln), nodeCount: 0, firstPromptTs: "", firstPrompt: "" };
         bandAcc.set(ln.sessionId, acc);
       }
-      acc.minX = Math.min(acc.minX, ln.x); acc.maxX = Math.max(acc.maxX, ln.x);
-      acc.minY = Math.min(acc.minY, ln.y); acc.maxY = Math.max(acc.maxY, ln.y);
+      acc.minX = Math.min(acc.minX, ln.x); acc.maxX = Math.max(acc.maxX, visualRight(ln));
+      acc.minY = Math.min(acc.minY, ln.y); acc.maxY = Math.max(acc.maxY, visualBottom(ln));
       acc.nodeCount += 1;
     }
     for (const n of scopeNodes) {
@@ -407,8 +462,8 @@ export function buildLayout(
     for (const a of bandAcc.values()) {
       sessionBands.push({
         sessionId: a.sessionId, projectSlug: a.projectSlug,
-        minX: a.minX - LAYOUT.nodeRadius - 2, maxX: a.maxX + LAYOUT.nodeRadius + 2,
-        minY: a.minY - LAYOUT.nodeRadius - 2, maxY: a.maxY + LAYOUT.nodeRadius + 2,
+        minX: a.minX - boundsPad, maxX: a.maxX + boundsPad,
+        minY: a.minY - boundsPad, maxY: a.maxY + boundsPad,
         nodeCount: a.nodeCount, firstPrompt: a.firstPrompt,
         tokenSpark: sparks.get(a.sessionId)?.values ?? [],
         sparkNodeIds: sparks.get(a.sessionId)?.ids ?? [],
@@ -416,7 +471,10 @@ export function buildLayout(
     }
     sessionBands.sort((a, b) => a.minY - b.minY || a.minX - b.minX);
 
-    return { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks: [], subagentCountByParent };
+    return applySessionPositions(
+      { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks: [], subagentCountByParent },
+      sessionPositions,
+    );
   }
 
   // ───── Timeline layout: Y proportional to timestamp within each session ─────
@@ -476,6 +534,8 @@ export function buildLayout(
           role: n.role,
           subtype: n.subtype,
           isSidechain: n.isSidechain,
+          isSessionStart: isSessionStartPrompt(n),
+          isCompactBoundary: isCompactBoundary(n),
           isFork: forkParents.has(n.id),
           isShared: n.sessionsIn > 1,
           preview: n.preview,
@@ -540,29 +600,27 @@ export function buildLayout(
       for (const n of layoutNodes.values()) {
         if (n.x < bounds.minX) bounds.minX = n.x;
         if (n.y < bounds.minY) bounds.minY = n.y;
-        if (n.x > bounds.maxX) bounds.maxX = n.x;
-        if (n.y > bounds.maxY) bounds.maxY = n.y;
+        if (visualRight(n) > bounds.maxX) bounds.maxX = visualRight(n);
+        if (visualBottom(n) > bounds.maxY) bounds.maxY = visualBottom(n);
       }
-      bounds.minX -= LAYOUT.nodeRadius * 2;
-      bounds.minY -= LAYOUT.nodeRadius * 2;
-      bounds.maxX += LAYOUT.nodeRadius * 2;
-      bounds.maxY += LAYOUT.nodeRadius * 2;
+      bounds.minX -= boundsPad;
+      bounds.minY -= boundsPad;
+      bounds.maxX += boundsPad;
+      bounds.maxY += boundsPad;
     }
 
     // Session bands + sparks
     const bandAcc = new Map<string, { sessionId: string; projectSlug: string; minX: number; maxX: number; minY: number; maxY: number; nodeCount: number; firstPromptTs: string; firstPrompt: string }>();
     for (const ln of layoutNodes.values()) {
       let acc = bandAcc.get(ln.sessionId);
-      const cardOffsetX = nodeStyle === "cards" ? LAYOUT.cardWidth : 0;
-      const cardOffsetY = nodeStyle === "cards" ? (ln.cardHeight ?? 0) : 0;
       if (!acc) {
-        acc = { sessionId: ln.sessionId, projectSlug: ln.projectSlug, minX: ln.x, maxX: ln.x + cardOffsetX, minY: ln.y, maxY: ln.y + cardOffsetY, nodeCount: 0, firstPromptTs: "", firstPrompt: "" };
+        acc = { sessionId: ln.sessionId, projectSlug: ln.projectSlug, minX: ln.x, maxX: visualRight(ln), minY: ln.y, maxY: visualBottom(ln), nodeCount: 0, firstPromptTs: "", firstPrompt: "" };
         bandAcc.set(ln.sessionId, acc);
       }
       acc.minX = Math.min(acc.minX, ln.x);
-      acc.maxX = Math.max(acc.maxX, ln.x + cardOffsetX);
+      acc.maxX = Math.max(acc.maxX, visualRight(ln));
       acc.minY = Math.min(acc.minY, ln.y);
-      acc.maxY = Math.max(acc.maxY, ln.y + cardOffsetY);
+      acc.maxY = Math.max(acc.maxY, visualBottom(ln));
       acc.nodeCount += 1;
     }
     for (const n of scopeNodes) {
@@ -579,8 +637,8 @@ export function buildLayout(
     for (const a of bandAcc.values()) {
       sessionBands.push({
         sessionId: a.sessionId, projectSlug: a.projectSlug,
-        minX: a.minX - LAYOUT.nodeRadius - 2, maxX: a.maxX + LAYOUT.nodeRadius + 2,
-        minY: a.minY - LAYOUT.nodeRadius - 2, maxY: a.maxY + LAYOUT.nodeRadius + 2,
+        minX: a.minX - boundsPad, maxX: a.maxX + boundsPad,
+        minY: a.minY - boundsPad, maxY: a.maxY + boundsPad,
         nodeCount: a.nodeCount, firstPrompt: a.firstPrompt,
         tokenSpark: sparks.get(a.sessionId)?.values ?? [],
         sparkNodeIds: sparks.get(a.sessionId)?.ids ?? [],
@@ -588,7 +646,10 @@ export function buildLayout(
     }
     sessionBands.sort((a, b) => a.minX - b.minX || a.minY - b.minY);
 
-    return { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks: [], subagentCountByParent, nodeGapToPrev, timelineAnchors };
+    return applySessionPositions(
+      { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks: [], subagentCountByParent, nodeGapToPrev, timelineAnchors },
+      sessionPositions,
+    );
   }
 
   // Pick a row-wrap width that targets roughly square overall aspect ratio.
@@ -608,65 +669,111 @@ export function buildLayout(
     Math.sqrt(totalTreeWidth * maxTreeHeight * aspectTarget),
   );
 
-  // Lay out roots into rows. Project boundaries (in all-projects view) force a new row.
+  // Lay out sessions into wrapped rows. Each session is a compact vertical
+  // tree block; rows pack left-to-right so "grid" reads as an overview instead
+  // of a single tall list.
   const projectBands = new Map<string, { minX: number; maxX: number; minY: number; maxY: number }>();
   const layoutNodes = new Map<string, LayoutNode>();
   const edges: LayoutEdge[] = [];
 
-  // ───── Macro layout: SESSIONS stack vertically ─────
-  // Each root tree is placed at x=0 and cursorY advances by its height.
-  // Roots from the same session are contiguous (because of root sort order),
-  // so a session forms a vertical block. Projects separated by projectGap.
-  let cursorY = mode === "all-projects" ? LAYOUT.projectLabelHeight : 0;
-  let lastProject: string | null = null;
-  let lastSession: string | null = null;
-  void targetRowWidth;
-
+  const rootsBySession = new Map<string, string[]>();
   for (const rootId of roots) {
-    const rootNode = nodeMap.get(rootId)!;
-    const rootWidth = subtreeWidth.get(rootId)!;
-    const rootHeight = subtreeHeight.get(rootId)!;
-    // Project boundary in all-projects mode
-    if (lastProject !== null && rootNode.projectSlug !== lastProject) {
-      if (mode === "all-projects") cursorY += LAYOUT.projectGap;
-    }
-    // Session boundary within same project — small gap between sessions
-    if (lastSession !== null && rootNode.sessionId !== lastSession) {
-      cursorY += LAYOUT.treeGap;
-    }
-    lastProject = rootNode.projectSlug;
-    lastSession = rootNode.sessionId;
+    const sid = nodeMap.get(rootId)!.sessionId;
+    const list = rootsBySession.get(sid);
+    if (list) list.push(rootId);
+    else rootsBySession.set(sid, [rootId]);
+  }
+  const rootGap = nodeStyle === "cards" ? LAYOUT.cardSpacingV : LAYOUT.nodeSpacingV;
+  const sessionGapX = nodeStyle === "cards" ? 96 : 72;
+  const sessionGapY = nodeStyle === "cards" ? 112 : 88;
+  const minRowWidth = nodeStyle === "cards" ? 760 : 420;
+  const maxSessionWidth = Math.max(0, ...[...rootsBySession.values()].map((sessionRoots) =>
+    Math.max(...sessionRoots.map((r) => subtreeWidth.get(r) ?? 0)),
+  ));
+  const rowWidthLimit = Math.max(minRowWidth, maxSessionWidth, targetRowWidth);
 
-    placeTree(rootId, 0, cursorY, {
-      nodeMap,
-      sortedChildren,
-      subtreeWidth,
-      subtreeHeight,
-      layoutNodes,
-      edges,
-      forkParents,
-      payloadIndex: payload,
-      spacingV: SPACING_V,
-      spacingH: SPACING_H,
-      ownHeight,
-      cardHeightFor,
-      nodeStyle,
-    });
+  const sessionOrder = [...rootsBySession.keys()].sort((a, b) => {
+    const ra = rootsBySession.get(a)![0]!;
+    const rb = rootsBySession.get(b)![0]!;
+    const na = nodeMap.get(ra)!;
+    const nb = nodeMap.get(rb)!;
+    if (mode === "all-projects" && na.projectSlug !== nb.projectSlug) {
+      return na.projectSlug.localeCompare(nb.projectSlug);
+    }
+    const sa = sessionStartTime.get(a) ?? "";
+    const sb = sessionStartTime.get(b) ?? "";
+    if (sa !== sb) return sa.localeCompare(sb);
+    return a.localeCompare(b);
+  });
 
-    // Project band: track the y-range that this project occupies + max width
-    const band = projectBands.get(rootNode.projectSlug);
-    if (!band) {
-      projectBands.set(rootNode.projectSlug, {
-        minX: 0,
-        maxX: rootWidth,
-        minY: cursorY,
-        maxY: cursorY + rootHeight,
+  let cursorX = 0;
+  let cursorY = mode === "all-projects" ? LAYOUT.projectLabelHeight : 0;
+  let rowH = 0;
+  let lastProject: string | null = null;
+
+  for (const sid of sessionOrder) {
+    const sessionRoots = rootsBySession.get(sid)!;
+    const firstRoot = nodeMap.get(sessionRoots[0]!)!;
+    const sessionWidth = Math.max(...sessionRoots.map((r) => subtreeWidth.get(r) ?? 0));
+    const sessionHeight = sessionRoots.reduce((sum, r, idx) =>
+      sum + (subtreeHeight.get(r) ?? 0) + (idx === sessionRoots.length - 1 ? 0 : rootGap),
+    0);
+
+    if (mode === "all-projects" && lastProject !== null && firstRoot.projectSlug !== lastProject) {
+      cursorX = 0;
+      cursorY += rowH + LAYOUT.projectGap;
+      rowH = 0;
+    } else if (cursorX > 0 && cursorX + sessionWidth > rowWidthLimit) {
+      cursorX = 0;
+      cursorY += rowH + sessionGapY;
+      rowH = 0;
+    }
+    lastProject = firstRoot.projectSlug;
+
+    const sessionX = cursorX;
+    const sessionY = cursorY;
+    let rootY = sessionY;
+    for (const rootId of sessionRoots) {
+      const rootHeight = subtreeHeight.get(rootId) ?? 0;
+      placeTree(rootId, sessionX, rootY, {
+        nodeMap,
+        sortedChildren,
+        subtreeWidth,
+        subtreeHeight,
+        layoutNodes,
+        edges,
+        forkParents,
+        payloadIndex: payload,
+        spacingV: SPACING_V,
+        spacingH: SPACING_H,
+        ownHeight,
+        cardHeightFor,
+        isSessionStartPrompt,
+        isCompactBoundary,
+        nodeStyle,
+      });
+      rootY += rootHeight + rootGap;
+    }
+
+    const projectBand = projectBands.get(firstRoot.projectSlug);
+    const sessionMaxX = sessionX + sessionWidth;
+    const sessionMaxY = sessionY + sessionHeight;
+    if (!projectBand) {
+      projectBands.set(firstRoot.projectSlug, {
+        minX: sessionX,
+        maxX: sessionMaxX,
+        minY: sessionY,
+        maxY: sessionMaxY,
       });
     } else {
-      band.maxX = Math.max(band.maxX, rootWidth);
-      band.maxY = cursorY + rootHeight;
+      projectBand.minX = Math.min(projectBand.minX, sessionX);
+      projectBand.maxX = Math.max(projectBand.maxX, sessionMaxX);
+      projectBand.minY = Math.min(projectBand.minY, sessionY);
+      projectBand.maxY = Math.max(projectBand.maxY, sessionMaxY);
     }
-    cursorY += rootHeight + LAYOUT.nodeSpacingV;
+
+    cursorX += sessionWidth + sessionGapX;
+    rowH = Math.max(rowH, sessionHeight);
   }
 
   // Compute bounds
@@ -679,13 +786,13 @@ export function buildLayout(
     for (const n of layoutNodes.values()) {
       if (n.x < bounds.minX) bounds.minX = n.x;
       if (n.y < bounds.minY) bounds.minY = n.y;
-      if (n.x > bounds.maxX) bounds.maxX = n.x;
-      if (n.y > bounds.maxY) bounds.maxY = n.y;
+      if (visualRight(n) > bounds.maxX) bounds.maxX = visualRight(n);
+      if (visualBottom(n) > bounds.maxY) bounds.maxY = visualBottom(n);
     }
-    bounds.minX -= LAYOUT.nodeRadius * 2;
-    bounds.minY -= LAYOUT.nodeRadius * 2;
-    bounds.maxX += LAYOUT.nodeRadius * 2;
-    bounds.maxY += LAYOUT.nodeRadius * 2;
+    bounds.minX -= boundsPad;
+    bounds.minY -= boundsPad;
+    bounds.maxX += boundsPad;
+    bounds.maxY += boundsPad;
   }
 
   // Per-session bounding boxes. CRITICAL: with --fork-session sharing uuids
@@ -724,7 +831,7 @@ export function buildLayout(
       acc = {
         sessionId: sid,
         projectSlug: ln.projectSlug,
-        minX: ln.x, maxX: ln.x, minY: ln.y, maxY: ln.y,
+        minX: ln.x, maxX: visualRight(ln), minY: ln.y, maxY: visualBottom(ln),
         nodeCount: 0,
         firstPromptTs: "",
         firstPrompt: "",
@@ -732,9 +839,9 @@ export function buildLayout(
       bandAcc.set(sid, acc);
     }
     acc.minX = Math.min(acc.minX, ln.x);
-    acc.maxX = Math.max(acc.maxX, ln.x);
+    acc.maxX = Math.max(acc.maxX, visualRight(ln));
     acc.minY = Math.min(acc.minY, ln.y);
-    acc.maxY = Math.max(acc.maxY, ln.y);
+    acc.maxY = Math.max(acc.maxY, visualBottom(ln));
     acc.nodeCount += 1;
   }
   // First prompt per session label = earliest user "prompt" — use scopeNodes
@@ -755,30 +862,22 @@ export function buildLayout(
     sessionBands.push({
       sessionId: a.sessionId,
       projectSlug: a.projectSlug,
-      minX: a.minX - LAYOUT.nodeRadius - 2,
-      maxX: a.maxX + LAYOUT.nodeRadius + 2,
-      minY: a.minY - LAYOUT.nodeRadius - 2,
-      maxY: a.maxY + LAYOUT.nodeRadius + 2,
+      minX: a.minX - boundsPad,
+      maxX: a.maxX + boundsPad,
+      minY: a.minY - boundsPad,
+      maxY: a.maxY + boundsPad,
       nodeCount: a.nodeCount,
       firstPrompt: a.firstPrompt,
       tokenSpark: sparks.get(a.sessionId)?.values ?? [],
       sparkNodeIds: sparks.get(a.sessionId)?.ids ?? [],
     });
   }
-  // Stable sort by minX then minY for consistent draw order
-  sessionBands.sort((a, b) => a.minX - b.minX || a.minY - b.minY);
+  // Stable reading order for wrapped grid rows.
+  sessionBands.sort((a, b) => a.minY - b.minY || a.minX - b.minX);
 
   // Sequence links: when a session has multiple roots (subagents, /compact splits,
   // /clear breaks, etc.), draw dashed lines from end of root N to start of root N+1
   // in timestamp order so the user can see they belong to the same session.
-  const rootsBySession = new Map<string, string[]>();
-  for (const rootId of roots) {
-    const r = nodeMap.get(rootId);
-    if (!r) continue;
-    const arr = rootsBySession.get(r.sessionId);
-    if (arr) arr.push(rootId);
-    else rootsBySession.set(r.sessionId, [rootId]);
-  }
   // Helper: find the deepest descendant (greatest y) of a root via DFS along sortedChildren
   const deepestDescendant = (rootId: string): string => {
     let bestId = rootId;
@@ -818,7 +917,89 @@ export function buildLayout(
     }
   }
 
-  return { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks, subagentCountByParent };
+  return applySessionPositions(
+    { nodes: layoutNodes, edges, bounds, projectBands, sessionBands, sequenceLinks, subagentCountByParent },
+    sessionPositions,
+    nodeToRootSession,
+  );
+}
+
+function applySessionPositions(
+  layout: Layout,
+  sessionPositions: SessionPositionMap | null,
+  nodeSessionIds: Map<string, string> = new Map(),
+): Layout {
+  if (!sessionPositions) return layout;
+
+  const offsets = new Map<string, { dx: number; dy: number }>();
+  for (const band of layout.sessionBands) {
+    const target = sessionPositions[band.sessionId];
+    if (!target || !Number.isFinite(target.x) || !Number.isFinite(target.y)) continue;
+    const dx = target.x - band.minX;
+    const dy = target.y - band.minY;
+    if (dx === 0 && dy === 0) continue;
+    offsets.set(band.sessionId, { dx, dy });
+  }
+  if (offsets.size === 0) return layout;
+
+  for (const n of layout.nodes.values()) {
+    const sessionId = nodeSessionIds.get(n.id) ?? n.sessionId;
+    const offset = offsets.get(sessionId);
+    if (!offset) continue;
+    n.x += offset.dx;
+    n.y += offset.dy;
+  }
+
+  for (const band of layout.sessionBands) {
+    const offset = offsets.get(band.sessionId);
+    if (!offset) continue;
+    band.minX += offset.dx;
+    band.maxX += offset.dx;
+    band.minY += offset.dy;
+    band.maxY += offset.dy;
+  }
+
+  if (layout.timelineAnchors) {
+    for (const [sessionId, anchor] of layout.timelineAnchors) {
+      const offset = offsets.get(sessionId);
+      if (!offset) continue;
+      anchor.x += offset.dx;
+      anchor.xRight += offset.dx;
+      anchor.lastY += offset.dy;
+    }
+  }
+
+  const projectBands = new Map<string, { minX: number; maxX: number; minY: number; maxY: number }>();
+  const bounds: Bounds = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+  if (layout.sessionBands.length > 0) {
+    bounds.minX = Infinity;
+    bounds.minY = Infinity;
+    bounds.maxX = -Infinity;
+    bounds.maxY = -Infinity;
+    for (const band of layout.sessionBands) {
+      bounds.minX = Math.min(bounds.minX, band.minX);
+      bounds.minY = Math.min(bounds.minY, band.minY);
+      bounds.maxX = Math.max(bounds.maxX, band.maxX);
+      bounds.maxY = Math.max(bounds.maxY, band.maxY);
+
+      const existing = projectBands.get(band.projectSlug);
+      if (!existing) {
+        projectBands.set(band.projectSlug, {
+          minX: band.minX,
+          maxX: band.maxX,
+          minY: band.minY,
+          maxY: band.maxY,
+        });
+      } else {
+        existing.minX = Math.min(existing.minX, band.minX);
+        existing.maxX = Math.max(existing.maxX, band.maxX);
+        existing.minY = Math.min(existing.minY, band.minY);
+        existing.maxY = Math.max(existing.maxY, band.maxY);
+      }
+    }
+  }
+
+  return { ...layout, bounds, projectBands };
 }
 
 function placeTree(
@@ -838,6 +1019,8 @@ function placeTree(
     spacingH: number;
     ownHeight: (id: string) => number;
     cardHeightFor: (id: string) => number;
+    isSessionStartPrompt: (node: ForestNode) => boolean;
+    isCompactBoundary: (node: ForestNode) => boolean;
     nodeStyle: NodeStyle;
   },
 ): void {
@@ -854,6 +1037,8 @@ function placeTree(
     role: node.role,
     subtype: node.subtype,
     isSidechain: node.isSidechain,
+    isSessionStart: ctx.isSessionStartPrompt(node),
+    isCompactBoundary: ctx.isCompactBoundary(node),
     isFork: ctx.forkParents.has(id),
     isShared: node.sessionsIn > 1,
     preview: node.preview,

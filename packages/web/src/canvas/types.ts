@@ -77,6 +77,10 @@ export interface LayoutNode {
   role: "user" | "assistant";
   subtype: string | null;
   isSidechain: boolean;
+  /** True for the first real user prompt in a Claude Code session. */
+  isSessionStart: boolean;
+  /** True when this visible node is the best available anchor for a /compact event. */
+  isCompactBoundary: boolean;
   isFork: boolean;
   isShared: boolean; // appears in 2+ sessions
   preview: string;
@@ -160,7 +164,7 @@ export interface Layout {
 export type ViewMode = "per-project" | "all-projects";
 /**
  *  - grid: square-ish tree-map, fork siblings stack vertically
- *  - column: each session a row; prompts vertical, replies horizontal
+ *  - column: one top-aligned column per session; prompts vertical, replies horizontal
  *  - timeline: one column per session ordered left-to-right by session start;
  *    Y is timestamp-proportional within each session (with capped gaps so a
  *    week-long pause doesn't blow up the layout). Reveals temporal patterns
@@ -181,11 +185,17 @@ export type BackgroundStyle = "none" | "grid" | "dots";
  */
 export type ColorMode = "role" | "recency" | "cost";
 
+export interface SessionPosition {
+  x: number;
+  y: number;
+}
+
+export type SessionPositionMap = Record<string, SessionPosition>;
+
 /**
  * A user-created top-level workspace. Has a name + a curated list of session
  * IDs to include. Switching INTO a space shows the forest filtered to those
- * sessions only. Later (Phase 3c) spawning a new Claude Code session inside a
- * space automatically adds the new sessionId to its member list.
+ * sessions only. Spaces can also store custom 2D origins for member sessions.
  */
 export interface Space {
   id: string;
@@ -194,6 +204,8 @@ export interface Space {
   hue: number;
   /** Session IDs that belong to this space. Filters the forest when active. */
   sessionIds: string[];
+  /** Per-session top-left origin overrides in layout coordinates. */
+  sessionPositions?: SessionPositionMap;
   /** Optional free-form note shown at the top of the space's canvas. */
   note: string;
   /** ISO timestamp of creation. */
@@ -280,9 +292,9 @@ export const LAYOUT = {
   /** Card line height. */
   cardLineHeight: 14,
   /** Padding inside each card. */
-  cardPadding: 8,
+  cardPadding: 10,
   /** Height of the card header (role label row). */
-  cardHeaderHeight: 16,
+  cardHeaderHeight: 20,
   /** Vertical gap between adjacent cards. */
   cardSpacingV: 14,
   /** Horizontal spacing between sibling cards. */
