@@ -30,6 +30,7 @@ import { StatusBar } from "./StatusBar.js";
 import { NodeContextToolbar } from "./NodeContextToolbar.js";
 import { OnboardingTour } from "./OnboardingTour.js";
 import { LoadingSkeleton } from "./LoadingSkeleton.js";
+import { ProjectLegend } from "./ProjectLegend.js";
 import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type BackgroundStyle, type ColorMode, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type NodeStyle, type SessionFilter, type Space, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
 
 const PAN_THRESHOLD_PX = 5;
@@ -288,6 +289,14 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           addSessionToSpace(j.sessionId, spawnModal.targetSpaceId);
         }
         if (j.sessionId) {
+          // Optimistic ghost — show "spawning…" banner immediately; clears
+          // when the session appears in the forest via SSE backstop poll.
+          const sid = j.sessionId;
+          setPendingSpawns((prev) => {
+            const next = new Map(prev);
+            next.set(sid, Date.now());
+            return next;
+          });
           setSpawnModal({
             mode: "continue",
             sessionId: j.sessionId,
@@ -535,6 +544,11 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   const TOAST_TTL_MS = 6000;
   // Background-tab unread counter — badged on favicon + title until refocus.
   const [unreadCount, setUnreadCount] = useState(0);
+  // Optimistic spawn ghosts — sessionIds we've asked the server to create
+  // but haven't seen back through SSE yet. Render as a transient "spawning…"
+  // chip so the click-to-spawn action feels instant. Auto-clears when the
+  // session appears in the forest or after 15s (safety net).
+  const [pendingSpawns, setPendingSpawns] = useState<Map<string, number>>(new Map());
   // Keep a ref to the currently-watched session id so the SSE callback (which
   // is stable across renders) can read it without re-binding.
   const activeWatchedRef = useRef<string | null>(null);
@@ -622,6 +636,31 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     }
   }, []);
   useSse(onSse, fetchForest);
+
+  // Clear optimistic spawn ghosts once the real session appears in the forest,
+  // or after 15s as a safety net (in case the server failed silently).
+  useEffect(() => {
+    if (pendingSpawns.size === 0) return;
+    const sessionIdsInForest = new Set(forest?.nodes.map((n) => n.sessionId) ?? []);
+    const now = Date.now();
+    let changed = false;
+    const next = new Map(pendingSpawns);
+    for (const [sid, startMs] of pendingSpawns) {
+      if (sessionIdsInForest.has(sid) || now - startMs > 15000) {
+        next.delete(sid);
+        changed = true;
+      }
+    }
+    if (changed) setPendingSpawns(next);
+    // Re-check every second while there are pending — even if forest hasn't
+    // changed, the 15s safety timer needs to fire.
+    if (next.size > 0) {
+      const id = window.setTimeout(() => {
+        setPendingSpawns((p) => new Map(p)); // trigger re-run
+      }, 1000);
+      return () => window.clearTimeout(id);
+    }
+  }, [pendingSpawns, forest]);
 
   // Reset unread count when tab regains focus.
   useEffect(() => {
@@ -1927,6 +1966,34 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     };
   }, [layout, size, forest, selected, helpOpen, searchOpen, onClose, effectiveActiveSession, liveTipId, mode, scopeProject, toggleBookmark, multiSelected, navigateHistory, welcomeOpen, spawnModal, textPrompt, confirmDialog]);
 
+  // Map nodeId → sibling sessionIds (sessions branched from a shared
+  // parentUuid). A node is "fork-aware" if either:
+  //   (a) it IS a fork-parent (its uuid appears in forest.forks) — siblings
+  //       = all sessions that share this fork-parent
+  //   (b) its parentId is a fork-parent — siblings = those sessions minus self
+  // Used to surface "↗ N branches · jump" hints in the tooltip + toolbar.
+  const forkInfo = useMemo(() => {
+    const result = new Map<string, string[]>();
+    if (!forest) return result;
+    const forksByParent = new Map<string, string[]>();
+    for (const f of forest.forks) forksByParent.set(f.parentUuid, f.sessionIds);
+    for (const n of forest.nodes) {
+      const asParent = forksByParent.get(n.id);
+      if (asParent && asParent.length >= 2) {
+        result.set(n.id, asParent);
+        continue;
+      }
+      if (n.parentId) {
+        const asChild = forksByParent.get(n.parentId);
+        if (asChild) {
+          const siblings = asChild.filter((s) => s !== n.sessionId);
+          if (siblings.length > 0) result.set(n.id, siblings);
+        }
+      }
+    }
+    return result;
+  }, [forest]);
+
   // ───── Tooltip data ─────
   // Enriched in timeline mode with gap-from-prev; assistant nodes include
   // their output-token cost so heat-map values are interpretable on hover.
@@ -1946,6 +2013,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       if (gapMs && gapMs >= 60_000) {
         metaParts.push(`+${humanGap(gapMs)} since prev`);
       }
+      const branches = forkInfo.get(n.id) ?? null;
       return {
         kind: "node" as const,
         title: n.role === "assistant"
@@ -1955,6 +2023,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         meta: metaParts.join(" · "),
         color: n.isSidechain ? "#c084fc" : n.role === "assistant" ? "#fbbf24" : n.subtype === "prompt" ? "#34d399" : "#71717a",
         isSidechain: n.isSidechain,
+        branches,
       };
     } else {
       const band = layout?.sessionBands.find((b) => b.sessionId === hovered.id);
@@ -1977,9 +2046,10 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         color: projectColor(band.projectSlug),
         sess,
         isSidechain: false,
+        branches: null as string[] | null,
       };
     }
-  }, [hovered, forest, layout]);
+  }, [hovered, forest, layout, forkInfo]);
 
   // Mark the welcome modal as seen + close it (shared by Esc / backdrop / button).
   const closeWelcome = useCallback(() => {
@@ -2690,7 +2760,21 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               {highlightMatches(tooltipData.body, searchQuery)}
             </div>
             <div className="text-[10px] text-zinc-500 font-mono leading-tight">{tooltipData.meta}</div>
+            {tooltipData.branches && tooltipData.branches.length > 0 && (
+              <div className="text-[10px] text-cyan-400 font-mono leading-tight mt-1 pt-1 border-t border-zinc-800">
+                ↗ branches into {tooltipData.branches.length} session{tooltipData.branches.length === 1 ? "" : "s"} — click toolbar to jump
+              </div>
+            )}
           </div>
+        )}
+
+        {/* Project legend chip (top-left) — multi-project view only */}
+        {mode === "all-projects" && (
+          <ProjectLegend
+            forest={forest}
+            activeSlug={scopeProject}
+            onPickProject={(slug) => { setMode("per-project"); setScopeProject(slug); }}
+          />
         )}
 
         {/* Bookmark gutter (left edge) — stars at the screen-Y of each bookmark */}
@@ -2939,6 +3023,30 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
+        {/* Optimistic spawn ghosts — a stack of "spawning…" pills at top-center.
+            Clears when the real session appears via SSE (or after 15s safety). */}
+        {pendingSpawns.size > 0 && (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 z-30 flex flex-col gap-1 items-center">
+            {[...pendingSpawns.entries()].map(([sid, startMs]) => {
+              const age = Math.floor((Date.now() - startMs) / 1000);
+              return (
+                <div
+                  key={sid}
+                  className="px-3 py-1.5 bg-zinc-900/95 border border-emerald-700 rounded-full shadow-xl backdrop-blur text-xs flex items-center gap-2 text-emerald-300 font-mono"
+                >
+                  <span className="relative flex h-2 w-2 shrink-0">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                  </span>
+                  <span>spawning</span>
+                  <span className="text-zinc-400">{sid.slice(0, 8)}</span>
+                  <span className="text-zinc-600">· {age}s</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {/* StatusBar replaces the standalone LOD indicator (zoom / lod / scope /
             mode / selection / live status all in one strip at the bottom). */}
         <StatusBar
@@ -3081,6 +3189,11 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
               isInSpace={(spaceId) => {
                 const sp = spaces.find((x) => x.id === spaceId);
                 return !!sp && sp.sessionIds.includes(selNode.sessionId);
+              }}
+              branchSessionIds={forkInfo.get(selected) ?? null}
+              onJumpToBranch={(sid) => {
+                const band = layout?.sessionBands.find((b) => b.sessionId === sid);
+                if (band) animateTo(fitToBounds(band, size.w, size.h, 80));
               }}
               onToggleBookmark={() => toggleBookmark(selected)}
               onResumeCLI={(fork) => {

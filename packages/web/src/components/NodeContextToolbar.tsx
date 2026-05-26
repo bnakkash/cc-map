@@ -12,10 +12,14 @@ interface NodeContextToolbarProps {
   spaces: Space[];
   /** Whether the node's session is already in the named space. */
   isInSpace: (spaceId: string) => boolean;
+  /** Sibling session IDs reached by branching from this node, or null. */
+  branchSessionIds: string[] | null;
   onToggleBookmark: () => void;
   onResumeCLI: (fork: boolean) => void;
   onContinueInMap: () => void;
   onAddToSpace: (spaceId: string) => void;
+  /** Jump (fit) the camera to a sibling branch session band. */
+  onJumpToBranch: (sessionId: string) => void;
 }
 
 const TOOLBAR_H = 30;
@@ -36,15 +40,18 @@ export function NodeContextToolbar({
   isBookmarked,
   spaces,
   isInSpace,
+  branchSessionIds,
   onToggleBookmark,
   onResumeCLI,
   onContinueInMap,
   onAddToSpace,
+  onJumpToBranch,
 }: NodeContextToolbarProps) {
   const [pos, setPos] = useState<{ left: number; top: number; placement: "above" | "below" }>({
     left: -9999, top: -9999, placement: "above",
   });
   const [spaceMenuOpen, setSpaceMenuOpen] = useState(false);
+  const [branchMenuOpen, setBranchMenuOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -83,15 +90,18 @@ export function NodeContextToolbar({
     return () => cancelAnimationFrame(raf);
   }, [layout, selectedId, viewportWidth, viewportHeight, getTransform]);
 
-  // Close space menu when clicking outside
+  // Close menus when clicking outside
   useEffect(() => {
-    if (!spaceMenuOpen) return;
+    if (!spaceMenuOpen && !branchMenuOpen) return;
     const onDoc = (e: MouseEvent) => {
-      if (!containerRef.current?.contains(e.target as Node)) setSpaceMenuOpen(false);
+      if (!containerRef.current?.contains(e.target as Node)) {
+        setSpaceMenuOpen(false);
+        setBranchMenuOpen(false);
+      }
     };
     const id = window.setTimeout(() => document.addEventListener("click", onDoc), 0);
     return () => { window.clearTimeout(id); document.removeEventListener("click", onDoc); };
-  }, [spaceMenuOpen]);
+  }, [spaceMenuOpen, branchMenuOpen]);
 
   if (!layout.nodes.has(selectedId)) return null;
 
@@ -119,6 +129,40 @@ export function NodeContextToolbar({
       <ToolbarButton title="Fork with --fork-session" onClick={() => onResumeCLI(true)}>
         ⤴
       </ToolbarButton>
+      {branchSessionIds && branchSessionIds.length > 0 && (
+        <>
+          <ToolbarSep />
+          <div className="relative">
+            <ToolbarButton
+              title={`Branches into ${branchSessionIds.length} session${branchSessionIds.length === 1 ? "" : "s"}`}
+              onClick={() => {
+                if (branchSessionIds.length === 1) {
+                  onJumpToBranch(branchSessionIds[0]!);
+                } else {
+                  setBranchMenuOpen((v) => !v);
+                }
+              }}
+            >
+              <span className="text-cyan-300">↗</span> branch{branchSessionIds.length > 1 ? ` ▾` : ""}
+            </ToolbarButton>
+            {branchMenuOpen && branchSessionIds.length > 1 && (
+              <div className={`absolute ${pos.placement === "above" ? "bottom-full mb-1" : "top-full mt-1"} right-0 bg-zinc-900 border border-zinc-700 rounded shadow-xl py-1 min-w-[200px]`}>
+                {branchSessionIds.map((sid) => (
+                  <button
+                    key={sid}
+                    className="w-full text-left px-2 py-1 text-xs flex items-center gap-1.5 text-zinc-200 hover:bg-zinc-800"
+                    onClick={() => { onJumpToBranch(sid); setBranchMenuOpen(false); }}
+                    title={`Jump to session ${sid}`}
+                  >
+                    <span className="text-cyan-400">↗</span>
+                    <span className="font-mono text-zinc-300">{sid.slice(0, 8)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
       <ToolbarSep />
       <div className="relative">
         <ToolbarButton
