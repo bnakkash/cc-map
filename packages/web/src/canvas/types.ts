@@ -116,6 +116,9 @@ export interface SessionBand {
    *  the sparkline overlay to show "thinking intensity" across the session
    *  without zooming into individual messages. */
   tokenSpark: number[];
+  /** Parallel array to `tokenSpark` — the node uuid for each bar. Empty unless
+   *  populated by the layout builder. Used for sparkline-bar hover tooltips. */
+  sparkNodeIds?: string[];
 }
 
 export interface Layout {

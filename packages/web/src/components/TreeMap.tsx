@@ -17,6 +17,7 @@ import {
   getOffscreenLiveArrowBox,
   getSubagentBadgeAt,
   hitTest,
+  hitTestSparkline,
   lodOf,
   render,
 } from "../canvas/renderer.js";
@@ -61,6 +62,9 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   const navigatingHistoryRef = useRef(false);
   const [selectedDetail, setSelectedDetail] = useState<NodeResponse | null>(null);
   const [hovered, setHovered] = useState<{ kind: "node" | "session"; id: string } | null>(null);
+  // Sparkline bar hover — when cursor is over a session-band sparkline bar,
+  // show a small tooltip with the message ts + token count.
+  const [sparkHover, setSparkHover] = useState<{ nodeId: string; tokens: number } | null>(null);
   // Hover-tooltip grace period: don't flash the tooltip until cursor has rested
   // on a node for 200ms. Once tooltip is showing, swapping to a different node
   // shows immediately (no flicker). Reset to delayed when hover ends.
@@ -114,6 +118,20 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   // Cheaper than threading a forceOpen prop into every group.
   const SIDEBAR_GROUP_IDS = ["scope", "display", "live", "filter", "live-card", "saved", "activity"];
   const [sidebarKey, setSidebarKey] = useState(0);
+  // Resizable sidebar width — drag the right edge. Persisted to localStorage.
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem("cc-map-sidebar-width");
+      const n = raw ? parseInt(raw, 10) : NaN;
+      if (Number.isFinite(n) && n >= 180 && n <= 480) return n;
+    } catch {}
+    return 224; // default = old w-56
+  });
+  useEffect(() => {
+    try { localStorage.setItem("cc-map-sidebar-width", String(sidebarWidth)); } catch {}
+  }, [sidebarWidth]);
+  // Live drag tracking for the resize handle.
+  const sidebarDragRef = useRef<{ startX: number; startW: number } | null>(null);
   const setAllGroupsOpen = useCallback((open: boolean) => {
     for (const gid of SIDEBAR_GROUP_IDS) {
       try { localStorage.setItem(`cc-map-sb-${gid}`, open ? "1" : "0"); } catch {}
@@ -1090,9 +1108,34 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       kbd: "/",
       action: () => setSearchOpen(true),
     });
+    items.push({
+      id: "export-png",
+      category: "Actions",
+      label: "Export current view as PNG",
+      action: () => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        try {
+          const dataUrl = canvas.toDataURL("image/png");
+          const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 16);
+          const scopeStr = activeSpaceId
+            ? spaces.find((s) => s.id === activeSpaceId)?.name?.replace(/\s+/g, "_")
+            : (mode === "per-project" && scopeProject ? scopeProject : "all");
+          const a = document.createElement("a");
+          a.href = dataUrl;
+          a.download = `cc-map-${scopeStr ?? "view"}-${stamp}.png`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error("PNG export failed:", err);
+        }
+      },
+    });
 
     return items;
-  }, [forest, layout, bookmarks, spaces, savedViews, direction, nodeStyle, colorMode, mode, liveTipId, followLive, size.w, size.h]);
+  }, [forest, layout, bookmarks, spaces, savedViews, direction, nodeStyle, colorMode, mode, liveTipId, followLive, size.w, size.h, activeSpaceId, scopeProject]);
 
   // ───── Initial fit + re-fit when direction changes ─────
   // Prefer the ACTIVE session (the one you're typing in right now) so the live
@@ -1399,7 +1442,22 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       drag.samples.push({ x: e.clientX, y: e.clientY, ts: now });
       while (drag.samples.length > 2 && now - drag.samples[0]!.ts > 80) drag.samples.shift();
     } else if (layout) {
-      const hit = hitTest(layout, transformRef.current, e.clientX - rect.left, e.clientY - rect.top, nodeStyle);
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      // Sparkline hit-test first — if the cursor is on a bar, show that
+      // tooltip + skip the broader node/session hit (the sparkline lives
+      // ABOVE the band so it'd shadow the band's own hover).
+      const sparkHit = hitTestSparkline(layout, transformRef.current, mx, my);
+      if (sparkHit) {
+        if (!sparkHover || sparkHover.nodeId !== sparkHit.nodeId) {
+          setSparkHover({ nodeId: sparkHit.nodeId, tokens: sparkHit.tokens });
+        }
+        e.currentTarget.style.cursor = "pointer";
+        return;
+      } else if (sparkHover) {
+        setSparkHover(null);
+      }
+      const hit = hitTest(layout, transformRef.current, mx, my, nodeStyle);
       const next = hit ? { kind: hit.kind, id: hit.id } : null;
       const same = next && hovered && next.kind === hovered.kind && next.id === hovered.id;
       // Cursor coaching:
@@ -1425,6 +1483,19 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     const drag = dragRef.current;
     dragRef.current = null;
     if (!drag) return;
+    // Sparkline bar click → select that message and pan to it
+    if (!drag.moved && layout && sparkHover) {
+      const id = sparkHover.nodeId;
+      setSelected(id);
+      const ln = layout.nodes.get(id);
+      if (ln) {
+        const t = transformRef.current;
+        const sc = Math.max(t.scale, 1.5);
+        animateTo({ scale: sc, tx: size.w / 2 - ln.x * sc, ty: size.h / 2 - ln.y * sc }, 250);
+      }
+      dirtyRef.current = true;
+      return;
+    }
     if (drag.moved) {
       // Compute average velocity over the sampled window. Skip inertia for
       // tiny motions (mouse barely moved) and for paused releases (samples
@@ -2071,7 +2142,17 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   return (
     <div className="flex-1 flex overflow-hidden relative">
       {/* Sidebar */}
-      <div data-tour-id="sidebar" className="w-56 border-r border-zinc-800 bg-zinc-950 p-3 text-sm overflow-y-auto shrink-0">
+      {/* Sidebar resize handle: 4px column on the right edge. Drag to resize
+          (180-480px). The handle is a SIBLING of the scrolling sidebar so it
+          doesn't scroll with the content. */}
+      <div
+        data-tour-id="sidebar"
+        className="relative shrink-0"
+        style={{ width: sidebarWidth }}
+      >
+      <div
+        className="absolute inset-0 border-r border-zinc-800 bg-zinc-950 p-3 text-sm overflow-y-auto"
+      >
         {/* Collapse-all / expand-all — compact the sidebar to maximize canvas */}
         <div className="flex justify-end pb-1 -mt-1">
           <button
@@ -2701,6 +2782,31 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           <button onClick={() => setHelpOpen(true)} className="text-xs text-zinc-400 hover:text-zinc-200 underline">help (?)</button>
         </div>
       </div>
+      {/* Drag handle on the sidebar's right edge — sibling of the scroll
+          container so it stays anchored regardless of scroll. */}
+      <div
+        className="absolute top-0 right-0 bottom-0 w-1 cursor-col-resize hover:bg-emerald-700/60 transition-colors z-10"
+        onMouseDown={(e) => {
+          e.preventDefault();
+          sidebarDragRef.current = { startX: e.clientX, startW: sidebarWidth };
+          const onMove = (ev: MouseEvent) => {
+            const drag = sidebarDragRef.current;
+            if (!drag) return;
+            const next = Math.max(180, Math.min(480, drag.startW + (ev.clientX - drag.startX)));
+            setSidebarWidth(next);
+          };
+          const onUp = () => {
+            sidebarDragRef.current = null;
+            window.removeEventListener("mousemove", onMove);
+            window.removeEventListener("mouseup", onUp);
+          };
+          window.addEventListener("mousemove", onMove);
+          window.addEventListener("mouseup", onUp);
+        }}
+        onDoubleClick={() => setSidebarWidth(224)}
+        title="Drag to resize sidebar · double-click to reset"
+      />
+      </div>
 
       {/* Canvas */}
       <div ref={containerRef} className="flex-1 relative overflow-hidden">
@@ -2732,7 +2838,29 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             Anchored with a small offset; flips left of cursor if it would overflow
             the right edge. Suppressed when an inline card overlay is open since
             that already shows the full content. */}
-        {tooltipData && tooltipReady && cursor && !(nodeStyle === "cards" && selected) && (
+        {/* Sparkline bar tooltip (takes priority over the normal tooltip) */}
+        {sparkHover && cursor && (() => {
+          const n = forest.nodes.find((x) => x.id === sparkHover.nodeId);
+          if (!n) return null;
+          return (
+            <div
+              className="absolute pointer-events-none z-30 bg-zinc-900/95 border border-amber-700 rounded shadow-xl px-2.5 py-1.5 text-[10px] backdrop-blur font-mono"
+              style={{ left: Math.min(cursor.x + 12, size.w - 240), top: Math.max(8, cursor.y - 50) }}
+            >
+              <div className="text-amber-300 text-xs leading-tight">
+                {sparkHover.tokens.toLocaleString()} output tokens
+              </div>
+              <div className="text-zinc-400 text-[10px] mt-0.5">
+                {new Date(n.timestamp).toLocaleString()}
+              </div>
+              <div className="text-zinc-500 text-[10px] truncate max-w-[220px]">
+                {n.preview || "(no preview)"}
+              </div>
+            </div>
+          );
+        })()}
+
+        {tooltipData && tooltipReady && cursor && !(nodeStyle === "cards" && selected) && !sparkHover && (
           <div
             className="absolute pointer-events-none z-20 bg-zinc-900/95 border border-zinc-700 rounded shadow-lg px-3 py-2 text-xs w-80 backdrop-blur"
             style={(() => {

@@ -1450,6 +1450,45 @@ function prettySlug(slug: string): string {
 // ───── Hit testing ─────
 
 /** Hit-test a screen-coord point against nodes (detail LOD) or session bands (lower LODs). */
+/**
+ * Hit-test sparkline bars (the amber chart at the top of each session band).
+ * Mirrors drawSessionSparklines' geometry. Returns the matched bar's node id
+ * + the band so the tooltip can show "this message was at X time."
+ *
+ * Only fires at session/detail LOD (the sparkline isn't drawn at overview).
+ */
+export function hitTestSparkline(
+  layout: Layout,
+  transform: Transform,
+  screenX: number,
+  screenY: number,
+): { sessionId: string; nodeId: string; tokens: number } | null {
+  if (transform.scale < 0.15) return null; // overview LOD has no spark
+  const screenH = 18;
+  const layoutH = screenH / transform.scale;
+  // Inverse: convert screen → layout coords
+  const lx = (screenX - transform.tx) / transform.scale;
+  const ly = (screenY - transform.ty) / transform.scale;
+  for (const band of layout.sessionBands) {
+    if (!band.sparkNodeIds || band.sparkNodeIds.length === 0) continue;
+    if (lx < band.minX || lx > band.maxX) continue;
+    const y0 = band.minY;
+    const y1 = band.minY + layoutH;
+    if (ly < y0 || ly > y1) continue;
+    const bandW = band.maxX - band.minX;
+    const widthPx = bandW * transform.scale;
+    if (widthPx < 60) continue;
+    const barCount = band.sparkNodeIds.length;
+    const barW = bandW / barCount;
+    const idx = Math.floor((lx - band.minX) / barW);
+    if (idx < 0 || idx >= barCount) continue;
+    const nodeId = band.sparkNodeIds[idx]!;
+    const tokens = band.tokenSpark[idx] ?? 0;
+    return { sessionId: band.sessionId, nodeId, tokens };
+  }
+  return null;
+}
+
 export function hitTest(
   layout: Layout,
   transform: Transform,

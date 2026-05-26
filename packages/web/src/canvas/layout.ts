@@ -410,7 +410,8 @@ export function buildLayout(
         minX: a.minX - LAYOUT.nodeRadius - 2, maxX: a.maxX + LAYOUT.nodeRadius + 2,
         minY: a.minY - LAYOUT.nodeRadius - 2, maxY: a.maxY + LAYOUT.nodeRadius + 2,
         nodeCount: a.nodeCount, firstPrompt: a.firstPrompt,
-        tokenSpark: sparks.get(a.sessionId) ?? [],
+        tokenSpark: sparks.get(a.sessionId)?.values ?? [],
+        sparkNodeIds: sparks.get(a.sessionId)?.ids ?? [],
       });
     }
     sessionBands.sort((a, b) => a.minY - b.minY || a.minX - b.minX);
@@ -581,7 +582,8 @@ export function buildLayout(
         minX: a.minX - LAYOUT.nodeRadius - 2, maxX: a.maxX + LAYOUT.nodeRadius + 2,
         minY: a.minY - LAYOUT.nodeRadius - 2, maxY: a.maxY + LAYOUT.nodeRadius + 2,
         nodeCount: a.nodeCount, firstPrompt: a.firstPrompt,
-        tokenSpark: sparks.get(a.sessionId) ?? [],
+        tokenSpark: sparks.get(a.sessionId)?.values ?? [],
+        sparkNodeIds: sparks.get(a.sessionId)?.ids ?? [],
       });
     }
     sessionBands.sort((a, b) => a.minX - b.minX || a.minY - b.minY);
@@ -759,7 +761,8 @@ export function buildLayout(
       maxY: a.maxY + LAYOUT.nodeRadius + 2,
       nodeCount: a.nodeCount,
       firstPrompt: a.firstPrompt,
-      tokenSpark: sparks.get(a.sessionId) ?? [],
+      tokenSpark: sparks.get(a.sessionId)?.values ?? [],
+      sparkNodeIds: sparks.get(a.sessionId)?.ids ?? [],
     });
   }
   // Stable sort by minX then minY for consistent draw order
@@ -899,11 +902,12 @@ export function timelineNowY(
 }
 
 /**
- * Per-session output-tokens series, in chronological order, restricted to
- * assistant turns (users don't produce output tokens). Used by the session-band
- * sparkline overlay. Returns an empty array for sessions with no assistant turns.
+ * Per-session output-tokens series + parallel node-id array. Restricted to
+ * assistant turns (users don't produce output tokens), chronological order.
+ * Used by the session-band sparkline overlay; the node-id array lets the
+ * UI map a hovered bar back to a specific message.
  */
-function buildTokenSparks(layoutNodes: Map<string, LayoutNode>): Map<string, number[]> {
+function buildTokenSparks(layoutNodes: Map<string, LayoutNode>): Map<string, { values: number[]; ids: string[] }> {
   const bySession = new Map<string, LayoutNode[]>();
   for (const n of layoutNodes.values()) {
     if (n.role !== "assistant") continue;
@@ -914,10 +918,10 @@ function buildTokenSparks(layoutNodes: Map<string, LayoutNode>): Map<string, num
     }
     arr.push(n);
   }
-  const result = new Map<string, number[]>();
+  const result = new Map<string, { values: number[]; ids: string[] }>();
   for (const [sid, nodes] of bySession) {
     nodes.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-    result.set(sid, nodes.map((n) => n.outputTokens));
+    result.set(sid, { values: nodes.map((n) => n.outputTokens), ids: nodes.map((n) => n.id) });
   }
   return result;
 }
