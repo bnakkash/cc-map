@@ -9,7 +9,7 @@ import {
   projectColor,
   type ColorContext,
 } from "./colors.js";
-import { LAYOUT, type ColorMode, type Layout, type LayoutNode, type NodeStyle, type SessionBand, type ViewMode } from "./types.js";
+import { LAYOUT, type BackgroundStyle, type ColorMode, type Layout, type LayoutNode, type NodeStyle, type SessionBand, type ViewMode } from "./types.js";
 import { timelineNowY } from "./layout.js";
 
 // Draw dashed sequence links between same-session disconnected roots.
@@ -77,6 +77,12 @@ export interface RenderState {
   /** Set of node ids currently in the multi-select set (ctrl/cmd+click).
    *  Drawn with a cyan outline distinct from hover/select. */
   multiSelectedIds: Set<string> | null;
+  /** Performance.now() at which the current selection was made. Used to draw
+   *  a one-shot "spotlight ping" expanding ring at the selected node. */
+  selectionPingMs: number | null;
+  /** Canvas background pattern. "none" = flat zinc-950; otherwise a faint
+   *  world-space grid/dot field so you can feel pan/zoom even in empty areas. */
+  backgroundStyle: BackgroundStyle;
 }
 
 /**
@@ -129,6 +135,13 @@ export function render(
     x1: (viewportWidth - transform.tx) / transform.scale + margin,
     y1: (viewportHeight - transform.ty) / transform.scale + margin,
   };
+
+  // Background pattern (world-space so it pans/zooms with the map). Spacing
+  // adapts to scale: at very low zoom we'd draw millions of lines, so we
+  // bump the pitch up by factors of 5/10.
+  if (state.backgroundStyle !== "none") {
+    drawBackgroundPattern(ctx, state.backgroundStyle, transform.scale, view);
+  }
 
   // ───── Project hulls (subtle background per project) ─────
   // Each hull covers ONLY that project's actual Y range. Without this, projects
@@ -234,6 +247,25 @@ export function render(
     }
   }
 
+  ctx.restore();
+
+  // ───── Subtle radial vignette (screen-space) ─────
+  // Faint darkening at viewport corners — gives the canvas depth and signals
+  // "you can pan beyond this view" without explicit chrome. Cheap: one
+  // radial gradient draw per frame.
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const vw = viewportWidth;
+  const vh = viewportHeight;
+  const cx = vw / 2;
+  const cy = vh / 2;
+  const vignetteR0 = Math.min(vw, vh) * 0.45;
+  const vignetteR1 = Math.max(vw, vh) * 0.8;
+  const vg = ctx.createRadialGradient(cx, cy, vignetteR0, cx, cy, vignetteR1);
+  vg.addColorStop(0, "rgba(0, 0, 0, 0)");
+  vg.addColorStop(1, "rgba(0, 0, 0, 0.55)");
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, vw, vh);
   ctx.restore();
 
   // ───── Sticky session labels (screen-space) ─────
@@ -478,6 +510,7 @@ function renderSession(
   drawSessionSparklines(ctx, layout, state, view);
   drawSessionLabels(ctx, layout, state, view, /*minBandPx=*/ 18);
   drawSelectionAndHover(ctx, layout, state);
+  drawSelectionSpotlight(ctx, layout, state);
   drawLiveTip(ctx, layout, state);
 }
 
@@ -558,6 +591,7 @@ function renderDetail(
     drawInlineNodeLabels(ctx, layout, state, view);
   }
   drawSelectionAndHover(ctx, layout, state);
+  drawSelectionSpotlight(ctx, layout, state);
   drawLiveTip(ctx, layout, state);
 }
 
@@ -755,6 +789,7 @@ function renderCards(
   if (state.subagentsCollapsed) drawSubagentBadges(ctx, layout, state, view, /*cardMode=*/ true);
   drawTimelineGapLabels(ctx, layout, state, view, /*cardMode=*/ true);
   drawMultiSelect(ctx, layout, state, /*cardMode=*/ true);
+  drawSelectionSpotlight(ctx, layout, state);
 
   // Selection ring (already part of card border for selected, but draw the LIVE pulse here)
   drawLiveTip(ctx, layout, state);
@@ -1237,6 +1272,116 @@ function drawMultiSelect(
   }
 }
 
+/**
+ * Faint grid or dot pattern in world coords. Snaps line pitch to a power-of-10
+ * style step (50 / 100 / 500 / 1000 etc.) chosen so screen-space density stays
+ * around ~50px between lines regardless of zoom. Always quite dim so it sits
+ * behind everything else.
+ */
+function drawBackgroundPattern(
+  ctx: CanvasRenderingContext2D,
+  style: "grid" | "dots",
+  scale: number,
+  view: { x0: number; y0: number; x1: number; y1: number },
+): void {
+  // Target ~80px between adjacent gridlines on screen. Pick the closest "nice"
+  // pitch (...50, 100, 250, 500, 1000, 2500, 5000...) above (80/scale).
+  const targetLayoutPitch = 80 / scale;
+  const candidates = [25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000];
+  let pitch = candidates[candidates.length - 1]!;
+  for (const c of candidates) {
+    if (c >= targetLayoutPitch) { pitch = c; break; }
+  }
+  const x0 = Math.floor(view.x0 / pitch) * pitch;
+  const x1 = Math.ceil(view.x1 / pitch) * pitch;
+  const y0 = Math.floor(view.y0 / pitch) * pitch;
+  const y1 = Math.ceil(view.y1 / pitch) * pitch;
+
+  if (style === "grid") {
+    ctx.strokeStyle = "rgba(63, 63, 70, 0.35)"; // zinc-700 at low alpha
+    ctx.lineWidth = Math.max(0.5, 1 / scale);
+    ctx.beginPath();
+    for (let x = x0; x <= x1; x += pitch) {
+      ctx.moveTo(x, y0);
+      ctx.lineTo(x, y1);
+    }
+    for (let y = y0; y <= y1; y += pitch) {
+      ctx.moveTo(x0, y);
+      ctx.lineTo(x1, y);
+    }
+    ctx.stroke();
+    // Stronger major gridlines every 5 pitches for visual rhythm
+    ctx.strokeStyle = "rgba(82, 82, 91, 0.45)"; // zinc-600
+    ctx.beginPath();
+    const major = pitch * 5;
+    const mx0 = Math.floor(view.x0 / major) * major;
+    const mx1 = Math.ceil(view.x1 / major) * major;
+    const my0 = Math.floor(view.y0 / major) * major;
+    const my1 = Math.ceil(view.y1 / major) * major;
+    for (let x = mx0; x <= mx1; x += major) {
+      ctx.moveTo(x, my0);
+      ctx.lineTo(x, my1);
+    }
+    for (let y = my0; y <= my1; y += major) {
+      ctx.moveTo(mx0, y);
+      ctx.lineTo(mx1, y);
+    }
+    ctx.stroke();
+  } else {
+    // Dot pattern — at every grid intersection
+    ctx.fillStyle = "rgba(82, 82, 91, 0.55)";
+    const r = Math.max(0.7, 1.2 / scale);
+    for (let x = x0; x <= x1; x += pitch) {
+      for (let y = y0; y <= y1; y += pitch) {
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+}
+
+/** Selection-ring color tinted by the node's role/subtype so the ring reads
+ *  as a diegetic emphasis of what's selected (prompt → emerald, assistant →
+ *  amber, subagent → violet) instead of always-amber. */
+function selectionRingColor(role: "user" | "assistant", subtype: string | null, isSidechain: boolean): string {
+  if (isSidechain) return "#c084fc"; // violet
+  if (role === "user" && subtype === "prompt") return "#34d399"; // emerald
+  if (role === "assistant" && subtype === "thinking") return "#a78bfa"; // soft violet
+  if (role === "assistant" && subtype === "tool-only") return "#60a5fa"; // blue
+  if (role === "assistant") return "#fbbf24"; // amber for plain text reply
+  return NODE_RING_SELECTED; // fallback
+}
+
+/** Brief expanding-ring "ping" centered on the just-selected node. Single-shot
+ *  per selection change; the ring grows for SPOTLIGHT_MS then disappears.
+ *  Drawn AFTER the selection ring so it sits on top. */
+const SPOTLIGHT_MS = 350;
+function drawSelectionSpotlight(
+  ctx: CanvasRenderingContext2D,
+  layout: Layout,
+  state: RenderState,
+): void {
+  if (!state.selectedId || !state.selectionPingMs) return;
+  const dt = state.nowMs - state.selectionPingMs;
+  if (dt < 0 || dt > SPOTLIGHT_MS) return;
+  const n = layout.nodes.get(state.selectedId);
+  if (!n) return;
+  const t = dt / SPOTLIGHT_MS;
+  const eased = 1 - Math.pow(1 - t, 2); // ease-out-quad
+  const scale = state.transform.scale;
+  const baseR = Math.max(LAYOUT.nodeRadius, 2.5 / scale);
+  const startR = baseR * 1.5;
+  const endR = startR + 30 / scale;
+  const r = startR + (endR - startR) * eased;
+  const alpha = 1 - eased;
+  ctx.strokeStyle = `rgba(245, 158, 11, ${(alpha * 0.85).toFixed(3)})`;
+  ctx.lineWidth = Math.max(1.5, 2 / scale);
+  ctx.beginPath();
+  ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
 function drawSelectionAndHover(
   ctx: CanvasRenderingContext2D,
   layout: Layout,
@@ -1247,7 +1392,9 @@ function drawSelectionAndHover(
     const n = layout.nodes.get(state.selectedId);
     if (n) {
       const r = Math.max(LAYOUT.nodeRadius, 2.5 / scale);
-      ctx.strokeStyle = NODE_RING_SELECTED;
+      // Selection ring tinted to the node's role color so the ring reads as
+      // a diegetic emphasis instead of generic-amber-on-everything.
+      ctx.strokeStyle = selectionRingColor(n.role, n.subtype, n.isSidechain);
       ctx.lineWidth = Math.max(2.5, 3 / scale);
       ctx.beginPath();
       ctx.arc(n.x, n.y, r + Math.max(4, 5 / scale), 0, Math.PI * 2);

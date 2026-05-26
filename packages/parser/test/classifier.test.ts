@@ -80,8 +80,16 @@ describe("extractPreview", () => {
     expect(preview).toBe("part one part two");
   });
 
-  it("summarizes tool_use blocks", () => {
+  it("omits tool_use blocks from the preview (cards would otherwise show tool noise even with tool-call visibility off)", () => {
     const { preview } = extractPreview([{ type: "tool_use", name: "Read", id: "x" }]);
-    expect(preview).toContain("[tool_use: Read]");
+    expect(preview).toBe("");
+  });
+
+  it("preserves text when mixed with tool_use blocks", () => {
+    const { preview } = extractPreview([
+      { type: "text", text: "Let me look at that file." },
+      { type: "tool_use", name: "Read", id: "x", input: { path: "/foo" } },
+    ]);
+    expect(preview).toBe("Let me look at that file.");
   });
 });

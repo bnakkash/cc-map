@@ -23,9 +23,14 @@ import {
 import { buildColorContext, projectColor } from "../canvas/colors.js";
 import { prettySlug } from "../format.js";
 import { Minimap } from "./Minimap.js";
+import { setUnreadBadge } from "../faviconBadge.js";
 import { BookmarkGutter } from "./BookmarkGutter.js";
 import { CommandPalette, type PaletteItem } from "./CommandPalette.js";
-import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type ColorMode, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type NodeStyle, type SessionFilter, type Space, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
+import { StatusBar } from "./StatusBar.js";
+import { NodeContextToolbar } from "./NodeContextToolbar.js";
+import { OnboardingTour } from "./OnboardingTour.js";
+import { LoadingSkeleton } from "./LoadingSkeleton.js";
+import { DEFAULT_FILTER, DEFAULT_VISIBILITY, type BackgroundStyle, type ColorMode, type ForestNode, type ForestPayload, type Layout, type LayoutDirection, type NodeStyle, type SessionFilter, type Space, type ViewMode, type VisibilityFilter } from "../canvas/types.js";
 
 const PAN_THRESHOLD_PX = 5;
 
@@ -55,6 +60,17 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   const navigatingHistoryRef = useRef(false);
   const [selectedDetail, setSelectedDetail] = useState<NodeResponse | null>(null);
   const [hovered, setHovered] = useState<{ kind: "node" | "session"; id: string } | null>(null);
+  // Hover-tooltip grace period: don't flash the tooltip until cursor has rested
+  // on a node for 200ms. Once tooltip is showing, swapping to a different node
+  // shows immediately (no flicker). Reset to delayed when hover ends.
+  const [tooltipReady, setTooltipReady] = useState(false);
+  useEffect(() => {
+    if (!hovered) { setTooltipReady(false); return; }
+    if (tooltipReady) return; // already shown — swap immediately
+    const id = window.setTimeout(() => setTooltipReady(true), 200);
+    return () => window.clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hovered]);
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const [contextMenu, setContextMenu] = useState<{
     x: number; y: number;
@@ -401,6 +417,17 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     } catch {}
     return "role";
   });
+
+  const [backgroundStyle, setBackgroundStyle] = useState<BackgroundStyle>(() => {
+    try {
+      const raw = localStorage.getItem("cc-map-background");
+      if (raw === "none" || raw === "grid" || raw === "dots") return raw;
+    } catch {}
+    return "none";
+  });
+  useEffect(() => {
+    try { localStorage.setItem("cc-map-background", backgroundStyle); } catch {}
+  }, [backgroundStyle]);
   useEffect(() => {
     try { localStorage.setItem("cc-map-color-mode", colorMode); } catch {}
   }, [colorMode]);
@@ -423,6 +450,22 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
 
   const transformRef = useRef<Transform>({ tx: 0, ty: 0, scale: 1 });
   const dirtyRef = useRef(true);
+  // Pan inertia — on mouse-drag or WASD release with velocity, the camera
+  // keeps gliding for ~350ms with exponential decay. Cancelled on any new
+  // user input (mousedown, wheel, key). Feels like Mac trackpad scroll.
+  const inertiaRef = useRef<{ vx: number; vy: number; startMs: number; lastMs: number } | null>(null);
+  // Spotlight ping timestamp — bumped on each selection change so the renderer
+  // can draw a one-shot expanding ring at the selected node (350ms).
+  const selectionPingMsRef = useRef<number | null>(null);
+  // WASD smooth-pan: track which keys are held; the RAF loop reads this and
+  // advances the camera each frame. Separate from arrow-key node cycling.
+  // shift = faster (~2.1×). Cleared on blur to avoid stuck keys.
+  const wasdKeysRef = useRef<Set<string>>(new Set());
+  const wasdShiftRef = useRef<boolean>(false);
+  const wasdLastFrameMsRef = useRef<number>(0);
+  // Per-ms velocity from the most recent WASD frame; consumed on release to
+  // hand off to the inertia system so the camera glides to a stop.
+  const wasdLastVxVyRef = useRef<{ vx: number; vy: number } | null>(null);
   // Morph state: when the layout changes shape (direction or nodeStyle), we
   // smoothly interpolate node and band positions from prev → new over ~450ms
   // so the spatial transition is readable instead of a jarring snap.
@@ -490,6 +533,8 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
   }
   const [activityToasts, setActivityToasts] = useState<ActivityToast[]>([]);
   const TOAST_TTL_MS = 6000;
+  // Background-tab unread counter — badged on favicon + title until refocus.
+  const [unreadCount, setUnreadCount] = useState(0);
   // Keep a ref to the currently-watched session id so the SSE callback (which
   // is stable across renders) can read it without re-binding.
   const activeWatchedRef = useRef<string | null>(null);
@@ -559,6 +604,16 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           }
           if (newToasts.length > 0) {
             setActivityToasts((prev) => [...newToasts, ...prev].slice(0, 5));
+            // Background-tab unread badge — bump favicon/title counter ONLY
+            // when the tab is hidden. We need ALL interesting messages, not
+            // just other-session ones, so count from toAdd directly.
+            if (document.hidden) {
+              const interestingDelta = toAdd.filter((n) =>
+                (n.role === "assistant" && n.subtype === "text") ||
+                (n.role === "user" && n.subtype === "prompt")
+              ).length;
+              if (interestingDelta > 0) setUnreadCount((c) => c + interestingDelta);
+            }
           }
         }, 250);
       }
@@ -567,6 +622,24 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     }
   }, []);
   useSse(onSse, fetchForest);
+
+  // Reset unread count when tab regains focus.
+  useEffect(() => {
+    const onVisible = () => { if (!document.hidden) setUnreadCount(0); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, []);
+
+  // Apply favicon + title badge whenever unreadCount changes (or scope changes).
+  useEffect(() => {
+    const scope = activeSpace ? activeSpace.name
+      : (mode === "per-project" && scopeProject ? prettySlug(scopeProject) : null);
+    setUnreadBadge(unreadCount, scope);
+  }, [unreadCount, activeSpace, mode, scopeProject]);
 
   // Prune activity toasts that have aged out (TOAST_TTL_MS).
   useEffect(() => {
@@ -780,15 +853,34 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     for (const band of layout.sessionBands) {
       if (sessionsSeen.has(band.sessionId)) continue;
       sessionsSeen.add(band.sessionId);
-      const title = forest.sessionTitles?.[band.sessionId]?.aiTitle
-        || band.firstPrompt
-        || "(untitled)";
+      const info = forest.sessionTitles?.[band.sessionId];
+      const title = info?.aiTitle || band.firstPrompt || "(untitled)";
+      const projSlug = forest.nodes.find((n) => n.sessionId === band.sessionId)?.projectSlug ?? "";
+      const facts: { label: string; value: string }[] = [
+        { label: "session", value: band.sessionId.slice(0, 8) },
+        { label: "project", value: prettySlug(projSlug) },
+        { label: "messages", value: String(band.nodeCount) },
+      ];
+      if (info?.tokens) {
+        const tot = info.tokens.input + info.tokens.output + info.tokens.cacheRead;
+        if (tot > 0) facts.push({ label: "tokens", value: `${(tot / 1000).toFixed(1)}k` });
+      }
+      if (info?.startedAt) facts.push({ label: "started", value: new Date(info.startedAt).toLocaleDateString() });
+      if (info?.lastActivityAt) facts.push({ label: "last activity", value: new Date(info.lastActivityAt).toLocaleString() });
+      if (info?.toolsUsed && info.toolsUsed.length > 0) {
+        facts.push({ label: "tools", value: info.toolsUsed.slice(0, 5).join(", ") + (info.toolsUsed.length > 5 ? "…" : "") });
+      }
       items.push({
         id: `jump-session-${band.sessionId}`,
         category: "Jump to session",
         label: title.slice(0, 80),
         hint: `${band.sessionId.slice(0, 8)} · ${band.nodeCount} nodes`,
         action: () => { animateTo(fitToBounds(band, size.w, size.h, 80)); },
+        preview: {
+          title: title.slice(0, 200),
+          ...(info?.aiTitle && band.firstPrompt ? { subtitle: `First prompt: ${band.firstPrompt}` } : {}),
+          facts,
+        },
       });
     }
 
@@ -808,6 +900,16 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             const t = transformRef.current;
             animateTo({ scale: t.scale, tx: size.w / 2 - ln.x * t.scale, ty: size.h / 2 - ln.y * t.scale }, 350);
           }
+        },
+        preview: {
+          title: n.preview || bid.slice(0, 8),
+          subtitle: `${n.role}${n.subtype ? ` · ${n.subtype}` : ""} · ${prettySlug(n.projectSlug)}`,
+          ...(n.preview ? { body: n.preview } : {}),
+          facts: [
+            { label: "node", value: bid.slice(0, 8) },
+            { label: "session", value: n.sessionId.slice(0, 8) },
+            { label: "timestamp", value: new Date(n.timestamp).toLocaleString() },
+          ],
         },
       });
     }
@@ -832,6 +934,18 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
 
     // Saved views
     for (const v of savedViews) {
+      const vFacts: { label: string; value: string }[] = [
+        { label: "view scope", value: v.mode },
+        { label: "project", value: v.scopeProject ? prettySlug(v.scopeProject) : "all" },
+        { label: "layout", value: v.direction },
+        { label: "nodes", value: v.nodeStyle },
+        { label: "color", value: v.colorMode },
+      ];
+      if (v.filter.startDate || v.filter.endDate) {
+        vFacts.push({ label: "date", value: `${v.filter.startDate ?? "…"} → ${v.filter.endDate ?? "…"}` });
+      }
+      if (v.filter.requiredTools.length > 0) vFacts.push({ label: "tools", value: v.filter.requiredTools.join(", ") });
+      if (v.filter.bookmarkedOnly) vFacts.push({ label: "bookmarks", value: "★ only" });
       items.push({
         id: `view-${v.id}`,
         category: "Apply saved view",
@@ -845,6 +959,11 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           setNodeStyle(v.nodeStyle);
           setDirection(v.direction);
           setColorMode(v.colorMode);
+        },
+        preview: {
+          title: v.name,
+          subtitle: "Saved view — applies all settings below at once",
+          facts: vFacts,
         },
       });
     }
@@ -985,6 +1104,74 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           setSize({ w: cw, h: ch });
         }
       }
+      // Pan inertia — gliding after a mouse drag or WASD release. Exponential
+      // decay (half-life ~110ms) so it settles within ~350ms and feels native.
+      const inertia = inertiaRef.current;
+      if (inertia && wasdKeysRef.current.size === 0) {
+        const nowMs = performance.now();
+        const dt = nowMs - inertia.lastMs;
+        inertia.lastMs = nowMs;
+        const decay = Math.pow(0.5, dt / 110); // half-life 110ms
+        inertia.vx *= decay;
+        inertia.vy *= decay;
+        if (Math.hypot(inertia.vx, inertia.vy) < 0.02) {
+          inertiaRef.current = null;
+        } else {
+          transformRef.current = {
+            ...transformRef.current,
+            tx: transformRef.current.tx + inertia.vx * dt,
+            ty: transformRef.current.ty + inertia.vy * dt,
+          };
+          dirtyRef.current = true;
+        }
+      }
+      // WASD smooth pan — applied before camera transition so a press cancels
+      // any in-flight animateTo cleanly. On release with velocity, hand off to
+      // the inertia system so the camera glides to a stop.
+      const heldKeys = wasdKeysRef.current;
+      const wasHeld = wasdLastFrameMsRef.current !== 0;
+      if (heldKeys.size > 0) {
+        const nowMs = performance.now();
+        const last = wasdLastFrameMsRef.current || nowMs;
+        const dt = Math.min(64, nowMs - last) / 1000; // clamp dt so a tab unfreeze doesn't jump
+        wasdLastFrameMsRef.current = nowMs;
+        const SPEED_BASE = 800; // px/sec (screen-space, before transform)
+        const speed = (wasdShiftRef.current ? 2.1 : 1) * SPEED_BASE * dt;
+        let dx = 0;
+        let dy = 0;
+        if (heldKeys.has("w")) dy += 1;
+        if (heldKeys.has("s")) dy -= 1;
+        if (heldKeys.has("a")) dx += 1;
+        if (heldKeys.has("d")) dx -= 1;
+        if (dx !== 0 || dy !== 0) {
+          // Normalize diagonal so W+D moves at the same speed as W alone
+          const mag = Math.hypot(dx, dy);
+          dx = (dx / mag) * speed;
+          dy = (dy / mag) * speed;
+          transitionRef.current = null; // any active animateTo defers to user input
+          inertiaRef.current = null;
+          transformRef.current = {
+            ...transformRef.current,
+            tx: transformRef.current.tx + dx,
+            ty: transformRef.current.ty + dy,
+          };
+          // Stash the per-ms velocity so release can hand off to inertia
+          wasdLastVxVyRef.current = { vx: dx / (dt * 1000), vy: dy / (dt * 1000) };
+          dirtyRef.current = true;
+        }
+      } else {
+        if (wasHeld) {
+          // Just released — kick off inertia from last frame's velocity
+          const v = wasdLastVxVyRef.current;
+          if (v && Math.hypot(v.vx, v.vy) > 0.3) {
+            const nowMs = performance.now();
+            inertiaRef.current = { vx: v.vx, vy: v.vy, startMs: nowMs, lastMs: nowMs };
+            dirtyRef.current = true;
+          }
+        }
+        wasdLastFrameMsRef.current = 0;
+        wasdLastVxVyRef.current = null;
+      }
       // Animation: camera transform
       const tr = transitionRef.current;
       if (tr) {
@@ -1033,8 +1220,9 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         dirtyRef.current = true;
         if (t >= 1) morphRef.current = null;
       }
-      // Continuously dirty when there's anything animated (live pulse, transition, morph)
-      if (transitionRef.current || morphRef.current || liveTipId || effectiveActiveSession) {
+      // Continuously dirty when there's anything animated (live pulse, transition, morph, wasd pan, spotlight, inertia)
+      const pingActive = selectionPingMsRef.current !== null && performance.now() - selectionPingMsRef.current < 400;
+      if (transitionRef.current || morphRef.current || liveTipId || effectiveActiveSession || wasdKeysRef.current.size > 0 || pingActive || inertiaRef.current) {
         dirtyRef.current = true;
       }
       if (dirtyRef.current && cw > 0 && ch > 0) {
@@ -1056,6 +1244,8 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             colorMode,
             subagentsCollapsed: !visibility.subagent,
             multiSelectedIds: multiSelected.size > 0 ? multiSelected : null,
+            selectionPingMs: selectionPingMsRef.current,
+            backgroundStyle,
           },
           cw,
           ch,
@@ -1065,10 +1255,18 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [layout, size, selected, hovered, mode, matches, forest, liveTipId, effectiveActiveSession, nodeStyle, colorMode, visibility.subagent, multiSelected]);
+  }, [layout, size, selected, hovered, mode, matches, forest, liveTipId, effectiveActiveSession, nodeStyle, colorMode, visibility.subagent, multiSelected, backgroundStyle]);
 
   // ───── Mouse interactions ─────
-  const dragRef = useRef<{ startX: number; startY: number; startTx: number; startTy: number; moved: boolean } | null>(null);
+  const dragRef = useRef<{
+    startX: number; startY: number;
+    startTx: number; startTy: number;
+    moved: boolean;
+    // Sample buffer for velocity-on-release: keep the last few frames'
+    // (x, y, ts) so we can compute average velocity over ~80ms (smoother
+    // than just last-frame, which can be 0 if the cursor stopped briefly).
+    samples: { x: number; y: number; ts: number }[];
+  } | null>(null);
 
   const onMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (e.button !== 0) return;
@@ -1129,12 +1327,14 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
       }
     }
     transitionRef.current = null;
+    inertiaRef.current = null; // mousedown cancels any in-flight inertia
     dragRef.current = {
       startX: e.clientX,
       startY: e.clientY,
       startTx: transformRef.current.tx,
       startTy: transformRef.current.ty,
       moved: false,
+      samples: [{ x: e.clientX, y: e.clientY, ts: performance.now() }],
     };
   }, [layout, liveTipId, size.w, size.h, visibility.subagent, nodeStyle, toggleVisibility]);
 
@@ -1154,23 +1354,59 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         };
         dirtyRef.current = true;
       }
+      // Sample for inertia velocity. Keep only the most recent ~80ms of samples
+      // so a brief pause before release doesn't poison the velocity calculation.
+      const now = performance.now();
+      drag.samples.push({ x: e.clientX, y: e.clientY, ts: now });
+      while (drag.samples.length > 2 && now - drag.samples[0]!.ts > 80) drag.samples.shift();
     } else if (layout) {
       const hit = hitTest(layout, transformRef.current, e.clientX - rect.left, e.clientY - rect.top, nodeStyle);
       const next = hit ? { kind: hit.kind, id: hit.id } : null;
       const same = next && hovered && next.kind === hovered.kind && next.id === hovered.id;
+      // Cursor coaching:
+      //   shift+hover over node → copy   (shift+drag adds to a Space)
+      //   ctrl/cmd+hover over node → cell (multi-select toggle)
+      //   plain hover over node → pointer
+      //   else → grab
+      let cursor = "grab";
+      if (hit) {
+        if (e.shiftKey) cursor = "copy";
+        else if (e.ctrlKey || e.metaKey) cursor = "cell";
+        else cursor = "pointer";
+      }
+      e.currentTarget.style.cursor = cursor;
       if (!same) {
         setHovered(next);
-        e.currentTarget.style.cursor = hit ? "pointer" : "grab";
         dirtyRef.current = true;
       }
     }
-  }, [layout, hovered]);
+  }, [layout, hovered, nodeStyle]);
 
   const onMouseUp = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const drag = dragRef.current;
     dragRef.current = null;
     if (!drag) return;
-    if (drag.moved) return;
+    if (drag.moved) {
+      // Compute average velocity over the sampled window. Skip inertia for
+      // tiny motions (mouse barely moved) and for paused releases (samples
+      // span a long time but no recent motion).
+      const samples = drag.samples;
+      if (samples.length >= 2) {
+        const first = samples[0]!;
+        const last = samples[samples.length - 1]!;
+        const dt = last.ts - first.ts;
+        if (dt > 0 && performance.now() - last.ts < 50) {
+          const vx = (last.x - first.x) / dt; // px/ms
+          const vy = (last.y - first.y) / dt;
+          // Only kick inertia if release velocity > ~0.3 px/ms (= 300px/sec)
+          if (Math.hypot(vx, vy) > 0.3) {
+            inertiaRef.current = { vx, vy, startMs: performance.now(), lastMs: performance.now() };
+            dirtyRef.current = true;
+          }
+        }
+      }
+      return;
+    }
     if (!layout) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const hit = hitTest(layout, transformRef.current, e.clientX - rect.left, e.clientY - rect.top, nodeStyle);
@@ -1297,6 +1533,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       transitionRef.current = null;
+      inertiaRef.current = null; // wheel cancels inertia
       const rect = canvas.getBoundingClientRect();
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
@@ -1412,6 +1649,13 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     h.entries.push(selected);
     if (h.entries.length > 50) h.entries = h.entries.slice(-50);
     h.cursor = h.entries.length - 1;
+  }, [selected]);
+
+  // Spotlight ping on every new selection — renderer reads this from state.
+  useEffect(() => {
+    if (selected == null) { selectionPingMsRef.current = null; return; }
+    selectionPingMsRef.current = performance.now();
+    dirtyRef.current = true;
   }, [selected]);
 
   const navigateHistory = useCallback((dir: -1 | 1) => {
@@ -1638,8 +1882,49 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           break;
       }
     };
+    // WASD smooth pan: track held keys; RAF loop reads + advances camera.
+    // Ignored when typing in an input/textarea. Shift = faster pan.
+    const isTyping = () => {
+      const tag = document.activeElement?.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA";
+    };
+    const onWasdDown = (e: KeyboardEvent) => {
+      if (isTyping()) return;
+      const k = e.key.toLowerCase();
+      if (k === "w" || k === "a" || k === "s" || k === "d") {
+        if (e.ctrlKey || e.metaKey || e.altKey) return; // don't fight chord shortcuts
+        e.preventDefault();
+        wasdKeysRef.current.add(k);
+        wasdShiftRef.current = e.shiftKey;
+        dirtyRef.current = true;
+      } else if (e.key === "Shift") {
+        wasdShiftRef.current = true;
+      }
+    };
+    const onWasdUp = (e: KeyboardEvent) => {
+      const k = e.key.toLowerCase();
+      if (k === "w" || k === "a" || k === "s" || k === "d") {
+        wasdKeysRef.current.delete(k);
+      } else if (e.key === "Shift") {
+        wasdShiftRef.current = false;
+      }
+    };
+    // Clear keys on blur / visibility change so a held key never gets stuck
+    // (e.g., user Alt+Tabs away mid-press).
+    const onBlur = () => { wasdKeysRef.current.clear(); wasdShiftRef.current = false; };
+
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onWasdDown);
+    window.addEventListener("keyup", onWasdUp);
+    window.addEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keydown", onWasdDown);
+      window.removeEventListener("keyup", onWasdUp);
+      window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onBlur);
+    };
   }, [layout, size, forest, selected, helpOpen, searchOpen, onClose, effectiveActiveSession, liveTipId, mode, scopeProject, toggleBookmark, multiSelected, navigateHistory, welcomeOpen, spawnModal, textPrompt, confirmDialog]);
 
   // ───── Tooltip data ─────
@@ -1710,13 +1995,13 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
     return <div className="flex-1 flex items-center justify-center text-red-400">{error}</div>;
   }
   if (!forest) {
-    return <div className="flex-1 flex items-center justify-center text-zinc-500">loading forest…</div>;
+    return <LoadingSkeleton />;
   }
 
   return (
     <div className="flex-1 flex overflow-hidden relative">
       {/* Sidebar */}
-      <div className="w-56 border-r border-zinc-800 bg-zinc-950 p-3 text-sm overflow-y-auto shrink-0">
+      <div data-tour-id="sidebar" className="w-56 border-r border-zinc-800 bg-zinc-950 p-3 text-sm overflow-y-auto shrink-0">
         {/* Collapse-all / expand-all — compact the sidebar to maximize canvas */}
         <div className="flex justify-end pb-1 -mt-1">
           <button
@@ -1945,6 +2230,25 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                 }
               >
                 {m}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div className="text-zinc-500 text-xs mb-1">Background</div>
+          <div className="flex gap-1">
+            {(["none", "grid", "dots"] as const).map((b) => (
+              <button
+                key={b}
+                onClick={() => setBackgroundStyle(b)}
+                className={`px-2 py-1 rounded text-xs flex-1 ${backgroundStyle === b ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"}`}
+                title={
+                  b === "none" ? "flat black canvas" :
+                  b === "grid" ? "faint grid (helps feel pan/zoom in empty areas)" :
+                  "faint dot field"
+                }
+              >
+                {b}
               </button>
             ))}
           </div>
@@ -2257,23 +2561,32 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                   const n = forest.nodes.find((x) => x.id === bid);
                   if (!n) return null;
                   return (
-                    <button
-                      key={bid}
-                      className="w-full text-left px-1 py-0.5 rounded hover:bg-zinc-900 text-zinc-400 text-[10px] flex items-center gap-1"
-                      onClick={() => {
-                        setSelected(bid);
-                        const ln = layout?.nodes.get(bid);
-                        if (ln) {
-                          const t = transformRef.current;
-                          const sc = Math.max(t.scale, 1.5);
-                          animateTo({ scale: sc, tx: size.w / 2 - ln.x * sc, ty: size.h / 2 - ln.y * sc }, 250);
-                        }
-                      }}
-                      title={n.preview}
-                    >
-                      <span className="text-amber-400 shrink-0">★</span>
-                      <span className="truncate">{n.preview || bid.slice(0, 8)}</span>
-                    </button>
+                    <div key={bid} className="group flex items-center gap-1">
+                      <button
+                        className="flex-1 text-left px-1 py-0.5 rounded hover:bg-zinc-900 text-zinc-400 text-[10px] flex items-center gap-1 min-w-0"
+                        onClick={() => {
+                          setSelected(bid);
+                          const ln = layout?.nodes.get(bid);
+                          if (ln) {
+                            const t = transformRef.current;
+                            const sc = Math.max(t.scale, 1.5);
+                            animateTo({ scale: sc, tx: size.w / 2 - ln.x * sc, ty: size.h / 2 - ln.y * sc }, 250);
+                          }
+                        }}
+                        title={n.preview}
+                      >
+                        <span className="text-amber-400 shrink-0">★</span>
+                        <span className="truncate">{n.preview || bid.slice(0, 8)}</span>
+                      </button>
+                      <button
+                        onClick={() => toggleBookmark(bid)}
+                        className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-400 text-[10px] px-1 shrink-0"
+                        title="Remove bookmark"
+                        aria-label="Remove bookmark"
+                      >
+                        ✕
+                      </button>
+                    </div>
                   );
                 })}
               </div>
@@ -2304,8 +2617,12 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
                 </div>
               ) : null;
             })()}
-            <div>{layout?.nodes.size.toLocaleString() ?? 0} visible · {forest.nodes.length.toLocaleString()} total</div>
-            <div>{forest.sessionCount} sessions · {forest.forks.length} forks</div>
+            <div>
+              <AnimatedNumber value={layout?.nodes.size ?? 0} /> visible · <AnimatedNumber value={forest.nodes.length} /> total
+            </div>
+            <div>
+              <AnimatedNumber value={forest.sessionCount} /> sessions · <AnimatedNumber value={forest.forks.length} /> forks
+            </div>
           </div>
         </SidebarGroup>
 
@@ -2345,7 +2662,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             Anchored with a small offset; flips left of cursor if it would overflow
             the right edge. Suppressed when an inline card overlay is open since
             that already shows the full content. */}
-        {tooltipData && cursor && !(nodeStyle === "cards" && selected) && (
+        {tooltipData && tooltipReady && cursor && !(nodeStyle === "cards" && selected) && (
           <div
             className="absolute pointer-events-none z-20 bg-zinc-900/95 border border-zinc-700 rounded shadow-lg px-3 py-2 text-xs w-80 backdrop-blur"
             style={(() => {
@@ -2622,21 +2939,31 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
-        {/* LOD indicator (subtle, top-center; nudged down when scope pills are
-            occupying that spot). Pointer-events disabled so it's purely an info
-            badge that doesn't intercept clicks. */}
-        <div
-          className={`absolute left-1/2 -translate-x-1/2 z-10 text-[10px] text-zinc-500 font-mono pointer-events-none bg-zinc-900/70 backdrop-blur rounded px-2 py-0.5 ${
-            activeSpace || (mode === "per-project" && scopeProject) ? "top-12" : "top-3"
-          }`}
-        >
-          {lodOf(transformRef.current.scale)}
-        </div>
+        {/* StatusBar replaces the standalone LOD indicator (zoom / lod / scope /
+            mode / selection / live status all in one strip at the bottom). */}
+        <StatusBar
+          mode={mode}
+          scopeLabel={
+            activeSpace ? `✦ ${activeSpace.name}` :
+            (mode === "per-project" && scopeProject ? prettySlug(scopeProject) : null)
+          }
+          direction={direction}
+          nodeStyle={nodeStyle}
+          colorMode={colorMode}
+          backgroundStyle={backgroundStyle}
+          selectedCount={selected ? 1 : 0}
+          multiSelectedCount={multiSelected.size}
+          followLive={followLive}
+          liveSessionId={effectiveActiveSession}
+          liveTipTs={liveTipId ? forest.nodes.find((n) => n.id === liveTipId)?.timestamp ?? null : null}
+          layout={layout}
+          getTransform={() => transformRef.current}
+        />
 
         {/* Multi-select action bar (bottom-center) — appears when ctrl/cmd+click
             has accumulated 1+ nodes. Bulk bookmark + add-to-Space + clear. */}
         {multiSelected.size > 0 && (
-          <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-3 py-2 rounded bg-zinc-900/95 border border-cyan-700 text-xs text-zinc-200 backdrop-blur shadow-xl">
+          <div className="absolute bottom-10 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-3 py-2 rounded bg-zinc-900/95 border border-cyan-700 text-xs text-zinc-200 backdrop-blur shadow-xl">
             <span className="font-mono text-cyan-300 tabular-nums">{multiSelected.size}</span>
             <span className="text-zinc-400">selected</span>
             <span className="text-zinc-700">·</span>
@@ -2694,7 +3021,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
 
         {/* Recent activity toasts (bottom-right, stacked) */}
         {activityToasts.length > 0 && (
-          <div className="absolute bottom-3 right-3 z-30 flex flex-col-reverse gap-2 max-w-xs pointer-events-none">
+          <div className="absolute bottom-10 right-3 z-30 flex flex-col-reverse gap-2 max-w-xs pointer-events-none">
             {activityToasts.map((t) => {
               const age = Date.now() - t.receivedMs;
               const fadeOpacity = Math.max(0, 1 - age / TOAST_TTL_MS);
@@ -2731,10 +3058,59 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         {/* Drag-to-Space hint when no spaces yet. Sits ABOVE the multi-select
             toolbar so they don't overlap if both are active at once. */}
         {dragSession && spaces.length === 0 && (
-          <div className={`absolute left-1/2 -translate-x-1/2 z-30 px-3 py-2 rounded bg-zinc-900/95 border border-zinc-700 text-xs text-zinc-300 ${multiSelected.size > 0 ? "bottom-14" : "bottom-3"}`}>
+          <div className={`absolute left-1/2 -translate-x-1/2 z-30 px-3 py-2 rounded bg-zinc-900/95 border border-zinc-700 text-xs text-zinc-300 ${multiSelected.size > 0 ? "bottom-20" : "bottom-10"}`}>
             create a Space first to drop this session into one
           </div>
         )}
+
+        {/* Mini context toolbar above the selected node (dots mode only; in cards
+            mode the inline expand panel provides actions). Hidden when the
+            right-click context menu is open to avoid double-toolbar overlap. */}
+        {nodeStyle === "dots" && selected && layout?.nodes.has(selected) && !contextMenu && (() => {
+          const selNode = forest.nodes.find((n) => n.id === selected);
+          if (!selNode) return null;
+          return (
+            <NodeContextToolbar
+              layout={layout}
+              selectedId={selected}
+              viewportWidth={size.w}
+              viewportHeight={size.h}
+              getTransform={() => transformRef.current}
+              isBookmarked={bookmarks.has(selected)}
+              spaces={spaces}
+              isInSpace={(spaceId) => {
+                const sp = spaces.find((x) => x.id === spaceId);
+                return !!sp && sp.sessionIds.includes(selNode.sessionId);
+              }}
+              onToggleBookmark={() => toggleBookmark(selected)}
+              onResumeCLI={(fork) => {
+                const token = localStorage.getItem("cc-map-token") ?? "";
+                fetch("/api/resume", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                  body: JSON.stringify({ sessionId: selNode.sessionId, fork }),
+                })
+                  .then((r) => r.json())
+                  .then((r) => {
+                    if (!r.ok && r.command) {
+                      void navigator.clipboard.writeText(r.command);
+                      showToast(`Couldn't launch a terminal — command copied to clipboard: ${r.command}`, "error");
+                    }
+                  })
+                  .catch((e) => showToast(`Resume failed: ${e}`, "error"));
+              }}
+              onContinueInMap={() => {
+                setSpawnModal({
+                  mode: "continue",
+                  sessionId: selNode.sessionId,
+                  cwd: "",
+                  prompt: "",
+                });
+              }}
+              onAddToSpace={(spaceId) => addSessionToSpace(selNode.sessionId, spaceId)}
+            />
+          );
+        })()}
 
         {/* Inline card expansion (cards mode only). The pinned card takes
             priority over the live selection so you can keep one open while
@@ -2999,6 +3375,7 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
             <div className="col-span-2 text-zinc-100 font-semibold text-base mb-1">cc-map — controls</div>
             <KbdGroup title="Pan & zoom">
               <KbdRow keys={["drag"]} desc="pan" />
+              <KbdRow keys={["w", "a", "s", "d"]} desc="smooth pan (hold shift for fast)" />
               <KbdRow keys={["2-finger scroll"]} desc="pan (trackpad)" />
               <KbdRow keys={["ctrl", "+", "wheel"]} desc="zoom (or pinch)" />
               <KbdRow keys={["="]} desc="zoom in" />
@@ -3074,62 +3451,10 @@ export function TreeMap({ onClose }: { onClose: () => void }) {
         items={paletteItems}
       />
 
-      {/* Welcome modal — first-visit intro to what cc-map is and how to use it */}
-      {welcomeOpen && (
-        <div
-          className="absolute inset-0 z-50 bg-zinc-950/80 backdrop-blur flex items-center justify-center"
-          onClick={closeWelcome}
-        >
-          <div
-            ref={welcomeDialogRef}
-            tabIndex={-1}
-            role="dialog"
-            aria-modal="true"
-            aria-label="Welcome to cc-map"
-            className="bg-zinc-900 border border-zinc-700 rounded-lg p-6 max-w-lg space-y-4 shadow-2xl outline-none"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-zinc-100 font-semibold text-xl">Welcome to cc-map</div>
-            <p className="text-sm text-zinc-300 leading-relaxed">
-              A 2D map of every Claude Code session you've ever had. Each colored
-              ribbon is a session; zoom in to see individual prompts and replies.
-            </p>
-            <ul className="text-sm text-zinc-300 space-y-2 list-disc list-inside">
-              <li>
-                <span className="font-semibold text-emerald-300">live updates:</span>{" "}
-                new messages appear as soon as you send them — watch the pulsing
-                emerald tip
-              </li>
-              <li>
-                <span className="font-semibold text-amber-300">timeline mode:</span>{" "}
-                arranges sessions left-to-right by time, with Y = real elapsed
-                time inside each session
-              </li>
-              <li>
-                <span className="font-semibold text-cyan-300">spaces:</span>{" "}
-                curate sessions into named workspaces; shift+drag a node onto a
-                Space chip to add it
-              </li>
-              <li>
-                <span className="font-semibold text-violet-300">subagents:</span>{" "}
-                a "+N" badge means N subagent turns are hiding under that parent
-                — click to expand
-              </li>
-            </ul>
-            <div className="text-xs text-zinc-500 pt-2 border-t border-zinc-800">
-              Press <kbd className="px-1 rounded bg-zinc-800 border border-zinc-700">?</kbd> any time to see all keyboard shortcuts.
-            </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                className="px-4 py-2 rounded bg-emerald-700 hover:bg-emerald-600 text-white text-sm"
-                onClick={closeWelcome}
-              >
-                Got it
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Guided onboarding tour. Highlights real UI elements with a callout
+          per step. Triggered on first visit (no cc-map-seen-welcome flag) and
+          re-invokable via the help overlay's "show intro" link. */}
+      <OnboardingTour open={welcomeOpen} onClose={closeWelcome} />
 
       {/* Drag-to-Space follower chip */}
       {dragSession && (
@@ -3504,7 +3829,7 @@ function ZoomOverlay({
   void layout;
   void size;
   return (
-    <div className="absolute bottom-3 left-3 z-10 flex items-center gap-1 bg-zinc-900/85 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-300 font-mono backdrop-blur">
+    <div className="absolute bottom-10 left-3 z-10 flex items-center gap-1 bg-zinc-900/85 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-300 font-mono backdrop-blur">
       <button className="px-1.5 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700" onClick={() => onZoomChange(1 / 1.5)} title="−" aria-label="Zoom out">−</button>
       <span className="w-12 text-center">{(t.scale * 100).toFixed(0)}%</span>
       <button className="px-1.5 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700" onClick={() => onZoomChange(1.5)} title="=" aria-label="Zoom in">+</button>
@@ -3528,7 +3853,7 @@ function ColorLegend({ mode, layout }: { mode: "recency" | "cost"; layout: Layou
   if (mode === "recency") {
     if (cc.tsMax <= cc.tsMin) return null;
     return (
-      <div className="absolute bottom-3 left-8 z-20 px-2.5 py-2 bg-zinc-900/90 border border-zinc-700 rounded text-xs text-zinc-300 backdrop-blur shadow-xl">
+      <div className="absolute bottom-10 left-8 z-20 px-2.5 py-2 bg-zinc-900/90 border border-zinc-700 rounded text-xs text-zinc-300 backdrop-blur shadow-xl">
         <div className="text-[10px] text-zinc-500 uppercase tracking-wide mb-1">Recency</div>
         <div
           className="w-40 h-2 rounded"
@@ -3691,6 +4016,42 @@ function highlightMatches(text: string, query: string): React.ReactNode {
     i = found + needle.length;
   }
   return out;
+}
+
+/**
+ * Tweens a number from its previous value to the new value over ~350ms. Use
+ * for stat displays so changes feel like changes instead of snaps. Skips the
+ * animation when value < 50 (sub-50 swaps aren't worth the visual noise).
+ */
+function AnimatedNumber({
+  value,
+  format,
+  durationMs = 350,
+}: {
+  value: number;
+  format?: (n: number) => string;
+  durationMs?: number;
+}) {
+  const [display, setDisplay] = useState(value);
+  const tweenRef = useRef<{ from: number; to: number; startMs: number } | null>(null);
+  useEffect(() => {
+    if (Math.abs(value - display) < 50) { setDisplay(value); return; }
+    tweenRef.current = { from: display, to: value, startMs: performance.now() };
+    let raf = 0;
+    const tick = () => {
+      const t = tweenRef.current;
+      if (!t) return;
+      const k = Math.min(1, (performance.now() - t.startMs) / durationMs);
+      const eased = 1 - Math.pow(1 - k, 3);
+      setDisplay(t.from + (t.to - t.from) * eased);
+      if (k < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+  const out = format ? format(display) : Math.round(display).toLocaleString();
+  return <>{out}</>;
 }
 
 function humanGap(ms: number): string {

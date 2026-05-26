@@ -160,7 +160,7 @@ export function Minimap({
   if (!layout || layout.nodes.size === 0) return null;
 
   return (
-    <div className="absolute top-3 right-3 z-20 select-none">
+    <div data-tour-id="minimap" className="absolute top-3 right-3 z-20 select-none">
       {collapsed ? (
         <button
           onClick={() => setCollapsed(false)}

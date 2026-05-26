@@ -113,6 +113,19 @@ export function extractPreview(content: unknown, maxLen = 140): { preview: strin
   };
 }
 
+/**
+ * Extract a plaintext preview from a message's content blocks.
+ *
+ * IMPORTANT: tool_use blocks are deliberately NOT included. A mixed
+ * assistant turn (text + tool_use) is classified as "text" so the user can
+ * read the reply; if we also surfaced the tool_use stubs in the preview,
+ * cards looked like they were showing tool-call content even when the
+ * tool-call visibility toggle was off. The user can always inspect the full
+ * structured content (including tool_use JSON) via the inline card expand.
+ *
+ * For pure tool-only assistant turns, this returns an empty string — those
+ * are classified as "tool-only" and hidden when the toggle is off anyway.
+ */
 function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -126,10 +139,8 @@ function extractText(content: unknown): string {
         parts.push(b.content);
       } else if (b.type === "tool_result" && Array.isArray(b.content)) {
         parts.push(extractText(b.content));
-      } else if (b.type === "tool_use") {
-        const name = (b as { name?: unknown }).name;
-        parts.push(`[tool_use: ${typeof name === "string" ? name : "?"}]`);
       }
+      // tool_use blocks intentionally skipped — see docstring above.
     }
     return parts.join("\n");
   }

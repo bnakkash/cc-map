@@ -165,6 +165,9 @@ export type ViewMode = "per-project" | "all-projects";
  */
 export type LayoutDirection = "grid" | "column" | "timeline";
 export type NodeStyle = "dots" | "cards";
+/** Canvas background pattern. "none" = flat black; "grid" = faint zinc grid;
+ *  "dots" = sparse zinc dot field. Helps orient pan/zoom on big maps. */
+export type BackgroundStyle = "none" | "grid" | "dots";
 /**
  * How nodes are colored.
  *  - role: by user/assistant/subtype (the original)
